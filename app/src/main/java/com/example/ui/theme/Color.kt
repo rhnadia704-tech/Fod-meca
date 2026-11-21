@@ -1,0 +1,51 @@
+package com.example.ui.theme
+
+import androidx.compose.ui.graphics.Color
+
+// Dark Lab Telemetry Palette
+val LabBgDark = Color(0xFF0A0F1A)
+val LabSurfaceDark = Color(0xFF111927)
+val LabSurfaceElevatedDark = Color(0xFF182336)
+val LabOutlineDark = Color(0xFF28364F)
+val LabPrimaryDark = Color(0xFF38BDF8)
+val LabOnPrimaryDark = Color(0xFF042030)
+val LabSecondaryDark = Color(0xFF2DD4BF)
+val LabTertiaryDark = Color(0xFFA78BFA)
+val LabTextPrimaryDark = Color(0xFFE6EDF7)
+val LabTextSecondaryDark = Color(0xFF94A3B8)
+
+// Light Technical Paper Palette
+val LabBgLight = Color(0xFFF4F7FB)
+val LabSurfaceLight = Color(0xFFFFFFFF)
+val LabSurfaceElevatedLight = Color(0xFFEBF1F8)
+val LabOutlineLight = Color(0xFFCBD5E1)
+val LabPrimaryLight = Color(0xFF0284C7)
+val LabOnPrimaryLight = Color(0xFFFFFFFF)
+val LabSecondaryLight = Color(0xFF0D9488)
+val LabTertiaryLight = Color(0xFF6D28D9)
+val LabTextPrimaryLight = Color(0xFF0F172A)
+val LabTextSecondaryLight = Color(0xFF475569)
+
+// Semantic Evidence Status Colors (Dark)
+val StatusConfirmedDark = Color(0xFF34D399)
+val StatusConfirmedContainerDark = Color(0xFF064E3B)
+val StatusObservedDark = Color(0xFF38BDF8)
+val StatusObservedContainerDark = Color(0xFF0C4A6E)
+val StatusSuspectDark = Color(0xFFFBBF24)
+val StatusSuspectContainerDark = Color(0xFF78350F)
+val StatusFailedDark = Color(0xFFF87171)
+val StatusFailedContainerDark = Color(0xFF7F1D1D)
+val StatusUnknownDark = Color(0xFF94A3B8)
+val StatusUnknownContainerDark = Color(0xFF1E293B)
+
+// Semantic Evidence Status Colors (Light)
+val StatusConfirmedLight = Color(0xFF047857)
+val StatusConfirmedContainerLight = Color(0xFFD1FAE5)
+val StatusObservedLight = Color(0xFF0369A1)
+val StatusObservedContainerLight = Color(0xFFE0F2FE)
+val StatusSuspectLight = Color(0xFFB45309)
+val StatusSuspectContainerLight = Color(0xFFFEF3C7)
+val StatusFailedLight = Color(0xFFB91C1C)
+val StatusFailedContainerLight = Color(0xFFFEE2E2)
+val StatusUnknownLight = Color(0xFF475569)
+val StatusUnknownContainerLight = Color(0xFFE2E8F0)

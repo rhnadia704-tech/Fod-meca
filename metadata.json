@@ -1,0 +1,6 @@
+{
+  "name": "FOD Detector",
+  "description": "Application Android d'analyse forensique, de rétro-ingénierie et de comparaison du mécanisme Fingerprint On Display (FOD) entre Custom ROM et GSI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
