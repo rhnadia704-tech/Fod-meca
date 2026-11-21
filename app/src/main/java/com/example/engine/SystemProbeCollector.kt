@@ -469,7 +469,8 @@ class SystemProbeCollector(private val context: Context) {
         }
 
         val validPaths = paths.filter { p ->
-            !p.contains("'") && !p.contains("\"") && !p.contains(";")
+            !p.contains("'") && !p.contains("\"") && !p.contains(";") &&
+                !p.contains(">") && !p.contains("<") && !p.contains("$")
         }.take(45)
 
         if (validPaths.isEmpty()) {
@@ -504,7 +505,9 @@ class SystemProbeCollector(private val context: Context) {
             }
             return out
         }
-        val joined = paths.filter { !it.contains("'") && !it.contains(";") }.joinToString(" ") { "'$it'" }
+        val joined = paths.filter {
+            !it.contains("'") && !it.contains(";") && !it.contains(">") && !it.contains("<") && !it.contains("$")
+        }.joinToString(" ") { "'$it'" }
         if (joined.isBlank()) return emptyMap()
         val res = ShellExecutor.exec(
             "for p in $joined; do if [ -f \"\$p\" ]; then echo \"=== \$p ===\"; head -c 256 \"\$p\" 2>&1; echo ''; fi; done",

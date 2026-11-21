@@ -24,20 +24,18 @@ data class BinaryReadResult(
 
 object ShellExecutor {
 
-    private val forbiddenTokens = listOf(
-        "mount ", "umount ", "rm ", "mv ", "cp ", "chmod ", "chown ",
-        "setprop ", "dd of=", "flash", "fastboot", "mkfs", "insmod", "rmmod",
-        "tee "
+    private val forbiddenCommandRegex = Regex(
+        """(^|[;|&(\n\s])(mount|umount|rm|mv|cp|chmod|chown|setprop|flash|fastboot|mkfs|insmod|rmmod|tee)(\s|$)|(^|[;|&(\n\s])dd\s+of="""
     )
 
-    private fun validateReadOnly(command: String) {
+    internal fun validateReadOnly(command: String) {
         val sanitized = command.lowercase()
             .replace("2>/dev/null", "")
             .replace("2>&1", "")
-        for (token in forbiddenTokens) {
-            if (sanitized.contains(token)) {
-                throw SecurityException("Non-intrusive read-only policy blocked command containing '$token'")
-            }
+        val match = forbiddenCommandRegex.find(sanitized)
+        if (match != null) {
+            val token = match.groupValues[2].ifBlank { "dd of=" }
+            throw SecurityException("Non-intrusive read-only policy blocked command containing '$token'")
         }
         if (sanitized.contains(">>") || Regex("(^|[^2&])>").containsMatchIn(sanitized)) {
             throw SecurityException("Non-intrusive read-only policy blocked output redirection")

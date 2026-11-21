@@ -4,6 +4,7 @@ import com.example.engine.BaselineProbeResult
 import com.example.engine.ElfDisassembler
 import com.example.engine.FodComparatorEngine
 import com.example.engine.PatchAndArchitectureAnalyzer
+import com.example.engine.ShellExecutor
 import com.example.i18n.AppLanguage
 import com.example.model.ComponentCategory
 import com.example.model.DetectedPatch
@@ -272,5 +273,31 @@ class FodEngineUnitTest {
             threw = true
         }
         assertTrue(threw)
+    }
+
+    @Test
+    fun shellExecutor_allowsDrmPathAndBlocksMutatingCommands() {
+        // Must allow paths ending in "drm " or properties containing "flash"
+        ShellExecutor.validateReadOnly(
+            "find /sys/class/drm /sys/devices/virtual/touch -maxdepth 4 -iname '*fod*' 2>/dev/null | head -n 50"
+        )
+        ShellExecutor.validateReadOnly("getprop | grep -iE 'fod|flashlight'")
+
+        val blocked = listOf(
+            "rm -rf /data/local/tmp/x",
+            "ls /sys/class/drm; rm /tmp/a",
+            "dmesg | tee /sdcard/out.txt",
+            "setprop persist.sys.fod 1",
+            "cat /proc/cpuinfo > /sdcard/x.txt"
+        )
+        blocked.forEach { cmd ->
+            var didThrow = false
+            try {
+                ShellExecutor.validateReadOnly(cmd)
+            } catch (_: SecurityException) {
+                didThrow = true
+            }
+            assertTrue("Command should have been blocked: $cmd", didThrow)
+        }
     }
 }
