@@ -118,7 +118,12 @@ data class AppStrings(
     val settingsSecurityNoteTitle: String,
     val settingsSecurityNoteBody: String,
     val exportSuccessMessage: String,
-    val exportErrorMessage: String
+    val exportErrorMessage: String,
+    val fingerDownChainTitle: String,
+    val sysfsTransitionsTitle: String,
+    val compTrueGsiBlockers: String,
+    val compSharedNonBlockers: String,
+    val aiLocalFallbackNotice: String
 )
 
 val FrenchStrings = AppStrings(
@@ -141,14 +146,14 @@ val FrenchStrings = AppStrings(
     btnRunAiThinking = "Synthèse IA Gemini (High Thinking)",
 
     enrollmentGuideTitle = "Enregistrement d'empreinte requis",
-    enrollmentGuideBody = "La sonde trace en direct le pipeline FOD. Ouvrez les Paramètres Android, lancez l'ajout d'une nouvelle empreinte jusqu'au succès ou blocage réel, puis revenez ici.",
+    enrollmentGuideBody = "La sonde capture en direct (T0 → T_live → T1) le logcat, dmesg kernel, les nœuds sysfs FOD/HBM/touch et SurfaceFlinger. Ouvrez les Paramètres Android, posez le doigt sur la zone lumineuse FOD puis revenez ici.",
     btnOpenFingerprintSettings = "Ouvrir Paramètres Empreintes",
     btnFinishAndAnalyze = "Terminer & Analyser la session",
     btnCancelCapture = "Annuler",
-    capturingLiveLogs = "Capture live active...",
+    capturingLiveLogs = "Capture live active (sysfs/dmesg/logcat)...",
     eventsCapturedLabel = "événements FOD observés",
-    baselineScanRunning = "Inventaire HAL, Binder, ELF, sysfs & patchs en cours...",
-    deepAnalysisRunning = "Corrélation des traces, désassemblage ELF & graphes...",
+    baselineScanRunning = "Capture T0 : HAL, Binder, ELF, sysfs FOD & dmesg...",
+    deepAnalysisRunning = "Diff T0→T1, détection blocage silencieux & désassemblage...",
 
     dashboardTitle = "FOD LIVE TRACE",
     subTabSessionFlow = "SESSION FLOW",
@@ -182,7 +187,7 @@ val FrenchStrings = AppStrings(
     tapNodeHint = "Touchez un nœud du graphe pour inspecter ses preuves et dépendances.",
 
     comparatorTitle = "COMPARATEUR FORENSIQUE ROM vs GSI",
-    comparatorInvariantBanner = "Invariant actif : même boot et même vendor (non modifiés). L'analyse isole uniquement les écarts système, Binder, HBM/display, overlays et patchs.",
+    comparatorInvariantBanner = "Invariant actif : même boot et même vendor (non modifiés). Les éléments absents sur LES DEUX sont filtrés comme non bloquants ; seuls les vrais écarts bloquants sont mis en avant.",
     importCustomRomTitle = "CUSTOM ROM (Référence)",
     importGsiTitle = "GSI (Cible)",
     btnImportZip = "Importer ZIP",
@@ -209,7 +214,7 @@ val FrenchStrings = AppStrings(
     settingsThemeTitle = "Thème d'affichage",
     settingsThemeAutoDesc = "Suit automatiquement le mode clair ou sombre du système Android.",
     settingsRootTitle = "Mode Root (su) facultatif",
-    settingsRootDesc = "Lecture seule uniquement : lshal, dumpsys complets, nœuds sysfs DRM/HBM et binaires HAL ELF. Aucune écriture système.",
+    settingsRootDesc = "Lecture seule uniquement : lshal, dumpsys complets, dmesg kernel, nœuds sysfs DRM/HBM et binaires HAL ELF. Aucune écriture système.",
     btnTestRoot = "Tester l'accès Root",
     rootGrantedLabel = "Root actif (lecture seule vérifiée)",
     rootDeniedLabel = "Accès Root refusé ou binaire su absent",
@@ -223,7 +228,12 @@ val FrenchStrings = AppStrings(
     settingsSecurityNoteTitle = "Garantie analytique non intrusive",
     settingsSecurityNoteBody = "Aucune partition modifiée, aucun patch appliqué, aucun flash, aucun accès aux gabarits biométriques protégés.",
     exportSuccessMessage = "Export terminé avec succès",
-    exportErrorMessage = "Erreur d'exportation"
+    exportErrorMessage = "Erreur d'exportation",
+    fingerDownChainTitle = "Chaîne d'exécution au poser du doigt",
+    sysfsTransitionsTitle = "Transitions sysfs FOD/HBM/Touch (Avant → Pendant → Après)",
+    compTrueGsiBlockers = "Vrais Bloqueurs GSI",
+    compSharedNonBlockers = "Bruit partagé (Absent/KO sur les 2)",
+    aiLocalFallbackNotice = "Build CI sans google-services.json : Firebase AI non initialisé sur cet APK (ajoutez le secret GitHub GOOGLE_SERVICES_JSON pour activer Gemini 4 Carbon). Synthèse forensique locale générée ci-dessous :"
 )
 
 val EnglishStrings = AppStrings(
@@ -246,14 +256,14 @@ val EnglishStrings = AppStrings(
     btnRunAiThinking = "Gemini AI Synthesis (High Thinking)",
 
     enrollmentGuideTitle = "Fingerprint Enrollment Required",
-    enrollmentGuideBody = "Live FOD tracing is active. Open Android Settings, enroll a fingerprint until real success or real failure occurs, then return here.",
+    enrollmentGuideBody = "Live diff capture (T0 → T_live → T1) is tracking logcat, kernel dmesg, FOD/HBM/touch sysfs nodes, and SurfaceFlinger. Open Android Settings, place your finger on the FOD light, then return here.",
     btnOpenFingerprintSettings = "Open Fingerprint Settings",
     btnFinishAndAnalyze = "Finish & Analyze Session",
     btnCancelCapture = "Cancel",
-    capturingLiveLogs = "Live capture running...",
+    capturingLiveLogs = "Live capture running (sysfs/dmesg/logcat)...",
     eventsCapturedLabel = "FOD events observed",
-    baselineScanRunning = "Probing HALs, Binder, ELF binaries, sysfs & patches...",
-    deepAnalysisRunning = "Correlating traces, ELF disassembly & dependency graph...",
+    baselineScanRunning = "T0 baseline: probing HALs, Binder, ELF, FOD sysfs & dmesg...",
+    deepAnalysisRunning = "Diffing T0→T1, silent stall detection & disassembly...",
 
     dashboardTitle = "FOD LIVE TRACE",
     subTabSessionFlow = "SESSION FLOW",
@@ -287,7 +297,7 @@ val EnglishStrings = AppStrings(
     tapNodeHint = "Tap any graph node to inspect its evidence and edges.",
 
     comparatorTitle = "FORENSIC COMPARATOR: ROM vs GSI",
-    comparatorInvariantBanner = "Active invariant: identical untouched boot & vendor. Analysis isolates system layer, Binder, HBM/display, overlays, and patches.",
+    comparatorInvariantBanner = "Active invariant: identical untouched boot & vendor. Shared missing/failing baseline items are filtered out as non-blocking; only true GSI differential blockers are prioritized.",
     importCustomRomTitle = "CUSTOM ROM (Reference)",
     importGsiTitle = "GSI (Target)",
     btnImportZip = "Import ZIP",
@@ -314,7 +324,7 @@ val EnglishStrings = AppStrings(
     settingsThemeTitle = "Display Theme",
     settingsThemeAutoDesc = "Automatically follows Android system Light or Dark theme.",
     settingsRootTitle = "Optional Root Mode (su)",
-    settingsRootDesc = "Strictly read-only: lshal, full dumpsys, DRM/HBM sysfs nodes, and HAL ELF binaries. Zero system writes.",
+    settingsRootDesc = "Strictly read-only: lshal, full dumpsys, kernel dmesg, DRM/HBM sysfs nodes, and HAL ELF binaries. Zero system writes.",
     btnTestRoot = "Test Root Access",
     rootGrantedLabel = "Root active (read-only verified)",
     rootDeniedLabel = "Root access denied or su binary missing",
@@ -328,7 +338,12 @@ val EnglishStrings = AppStrings(
     settingsSecurityNoteTitle = "Non-Intrusive Analytical Guarantee",
     settingsSecurityNoteBody = "Zero partition edits, zero patching, zero flashing, zero access to protected biometric templates.",
     exportSuccessMessage = "Export completed successfully",
-    exportErrorMessage = "Export error"
+    exportErrorMessage = "Export error",
+    fingerDownChainTitle = "Finger-Down Execution Chain",
+    sysfsTransitionsTitle = "FOD/HBM/Touch Sysfs Transitions (Before → During → After)",
+    compTrueGsiBlockers = "True GSI Blockers",
+    compSharedNonBlockers = "Shared Noise (Missing/KO on Both)",
+    aiLocalFallbackNotice = "CI build without google-services.json: Firebase AI is not initialized in this APK (add GitHub Secret GOOGLE_SERVICES_JSON to enable Gemini 4 Carbon). Local forensic synthesis generated below:"
 )
 
 val LocalAppStrings = staticCompositionLocalOf { FrenchStrings }

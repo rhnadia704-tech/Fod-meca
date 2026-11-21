@@ -102,6 +102,8 @@ object StreamingReportExporter {
                 writeRawEntry(zip, "raw/sysfs_fod_nodes.txt", report.rawArtifacts.sysfsFodNodes)
                 writeRawEntry(zip, "raw/selinux_denials.txt", report.rawArtifacts.selinuxDenials)
                 writeRawEntry(zip, "raw/init_rc_snippets.txt", report.rawArtifacts.initRcSnippets)
+                writeRawEntry(zip, "raw/dmesg_delta.txt", report.rawArtifacts.dmesgDelta)
+                writeRawEntry(zip, "raw/surfaceflinger_live_delta.txt", report.rawArtifacts.surfaceFlingerLiveDelta)
             }
         }
         label
@@ -244,6 +246,23 @@ object StreamingReportExporter {
             w.appendLine()
         }
 
+        if (r.fingerDownChain.isNotEmpty()) {
+            w.appendLine("## 0. FINGER-DOWN EXECUTION CHAIN (${r.fingerDownChain.size} stages)")
+            r.fingerDownChain.forEach { s ->
+                w.appendLine("- **[${s.status}] ${s.stage}**: ${s.detail}")
+                if (s.evidence.isNotBlank()) w.appendLine("  - Evidence: `${s.evidence}`")
+            }
+            w.appendLine()
+        }
+
+        if (r.sysfsTransitions.isNotEmpty()) {
+            w.appendLine("## 0b. SYSFS TRANSITIONS (T0 -> T_live -> T1)")
+            r.sysfsTransitions.forEach { t ->
+                w.appendLine("- **[changed=${t.changed}]** `${t.nodePath}`: `${t.beforeValue}` -> ${t.liveValues} -> `${t.afterValue}`")
+            }
+            w.appendLine()
+        }
+
         w.appendLine("## 1. SESSION FLOW (${r.sessionFlow.size} events)")
         r.sessionFlow.forEach { e ->
             w.appendLine("- [${e.status} | ${e.knowledgeLevel}] `${e.timestamp}` **${e.phase}** (${e.component}) benign=${e.isBenignWarning} blocking=${e.isBlockingFailure}")
@@ -292,6 +311,8 @@ object StreamingReportExporter {
             "vintf_manifests" to r.rawArtifacts.vintfManifests,
             "service_list" to r.rawArtifacts.serviceList,
             "sysfs_fod_nodes" to r.rawArtifacts.sysfsFodNodes,
+            "dmesg_delta" to r.rawArtifacts.dmesgDelta,
+            "surfaceflinger_live_delta" to r.rawArtifacts.surfaceFlingerLiveDelta,
             "selinux_denials" to r.rawArtifacts.selinuxDenials,
             "init_rc_snippets" to r.rawArtifacts.initRcSnippets,
             "getprop_all" to r.rawArtifacts.getpropAll
@@ -356,6 +377,22 @@ object StreamingReportExporter {
         writeHtmlDetails(w, "RAW: sysfs_fod_nodes", r.rawArtifacts.sysfsFodNodes)
         writeHtmlDetails(w, "RAW: selinux_denials", r.rawArtifacts.selinuxDenials)
         writeHtmlDetails(w, "RAW: init_rc", r.rawArtifacts.initRcSnippets)
+        if (r.fingerDownChain.isNotEmpty()) {
+            w.appendLine("<h2>FINGER-DOWN EXECUTION CHAIN</h2><ul>")
+            r.fingerDownChain.forEach { s ->
+                w.appendLine("<li><b>[${s.status}] ${esc(s.stage)}</b>: ${esc(s.detail)}</li>")
+            }
+            w.appendLine("</ul>")
+        }
+        if (r.sysfsTransitions.isNotEmpty()) {
+            w.appendLine("<h2>SYSFS TRANSITIONS (Before → Live → After)</h2><ul>")
+            r.sysfsTransitions.forEach { t ->
+                w.appendLine("<li><b>[changed=${t.changed}]</b> <code>${esc(t.nodePath)}</code>: <code>${esc(t.beforeValue)}</code> → <code>${esc(t.liveValues.toString())}</code> → <code>${esc(t.afterValue)}</code></li>")
+            }
+            w.appendLine("</ul>")
+        }
+        writeHtmlDetails(w, "RAW: dmesg_delta", r.rawArtifacts.dmesgDelta)
+        writeHtmlDetails(w, "RAW: surfaceflinger_live_delta", r.rawArtifacts.surfaceFlingerLiveDelta)
         writeHtmlDetails(w, "RAW: getprop_all", r.rawArtifacts.getpropAll)
         w.appendLine("</body></html>")
     }
@@ -377,13 +414,15 @@ object StreamingReportExporter {
             w.appendLine()
         }
         val sections = listOf(
-            "Common Component Diffs" to c.commonComponentDiffs,
+            "TRUE GSI DIFFERENTIAL BLOCKERS (Filtered)" to c.trueGsiBlockers,
+            "Shared Non-Blocking Items (Missing/KO on Both)" to c.sharedNonBlockingItems,
             "Missing in GSI" to c.missingInGsi,
-            "Version & Interface Diffs" to c.versionAndInterfaceDiffs,
-            "Incompatible Libs & Services" to c.incompatibleLibsAndServices,
             "Configs, Overlays & Patches Diffs" to c.configAndPatchDiffs,
             "Missing Live Interactions" to c.missingLiveInteractions,
-            "Demonstrated Breaks" to c.demonstratedBreaks
+            "Demonstrated Breaks" to c.demonstratedBreaks,
+            "Common Component Diffs" to c.commonComponentDiffs,
+            "Version & Interface Diffs" to c.versionAndInterfaceDiffs,
+            "Incompatible Libs & Services" to c.incompatibleLibsAndServices
         )
         sections.forEach { (title, list) ->
             w.appendLine("## $title (${list.size})")
@@ -427,6 +466,8 @@ object StreamingReportExporter {
             w.appendLine("<h2>Gemini 4 Carbon · High Thinking Synthesis</h2><pre>${esc(c.aiDeepComparisonMarkdown)}</pre>")
         }
         val sections = listOf(
+            "TRUE GSI DIFFERENTIAL BLOCKERS" to c.trueGsiBlockers,
+            "Shared Non-Blocking Items (Missing/KO on Both)" to c.sharedNonBlockingItems,
             "Missing in GSI" to c.missingInGsi,
             "Patches, Configs & Overlays Diffs" to c.configAndPatchDiffs,
             "Missing Live Interactions" to c.missingLiveInteractions,

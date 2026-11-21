@@ -458,6 +458,50 @@ fun DiagnosticScreen(
 
             when (activeSubTab) {
                 0 -> { // SESSION FLOW
+                    if (report.fingerDownChain.isNotEmpty()) {
+                        item {
+                            TelemetrySectionCard(borderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)) {
+                                Text(strings.fingerDownChainTitle, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                                report.fingerDownChain.forEach { step ->
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(step.stage, style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+                                        StatusPill(status = step.status)
+                                    }
+                                    Text(step.detail, style = MaterialTheme.typography.bodySmall)
+                                    if (step.evidence.isNotBlank()) {
+                                        Text(
+                                            text = step.evidence,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (report.sysfsTransitions.isNotEmpty()) {
+                        item {
+                            val changedCount = report.sysfsTransitions.count { it.changed }
+                            TelemetrySectionCard(
+                                borderColor = if (changedCount > 0) LocalFodStatusColors.current.confirmed else LocalFodStatusColors.current.suspect
+                            ) {
+                                Text("${strings.sysfsTransitionsTitle} ($changedCount/${report.sysfsTransitions.size})", style = MaterialTheme.typography.titleSmall)
+                                report.sysfsTransitions.sortedByDescending { it.changed }.take(15).forEach { t ->
+                                    val c = if (t.changed) LocalFodStatusColors.current.confirmed else MaterialTheme.colorScheme.onSurfaceVariant
+                                    Text(
+                                        text = "${if (t.changed) "[CHANGED]" else "[STATIC]"} ${t.nodePath.substringAfterLast('/')}: ${t.beforeValue} → ${if (t.liveValues.isEmpty()) "-" else t.liveValues.joinToString(",")} → ${t.afterValue}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = c
+                                    )
+                                }
+                            }
+                        }
+                    }
                     items(report.sessionFlow, key = { it.id }) { event ->
                         TelemetrySectionCard {
                             Row(
@@ -784,6 +828,22 @@ private fun SummaryTabContent(
             HorizontalDivider()
             Text(strings.successDespiteNoiseTitle, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
             Text(report.summary.realSuccessDespiteNoiseNote, style = MaterialTheme.typography.bodyMedium)
+            if (report.fingerDownChain.isNotEmpty()) {
+                HorizontalDivider()
+                Text(strings.fingerDownChainTitle, style = MaterialTheme.typography.titleSmall)
+                report.fingerDownChain.forEach { st ->
+                    Text(
+                        text = "[${st.status}] ${st.stage}: ${st.detail}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = when (st.status) {
+                            EvidenceStatus.CONFIRMED -> statusColors.confirmed
+                            EvidenceStatus.FAILED -> statusColors.failed
+                            EvidenceStatus.SUSPECT -> statusColors.suspect
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    )
+                }
+            }
         }
 
         if (report.environment.accessLimitations.isNotEmpty()) {

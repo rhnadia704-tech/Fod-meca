@@ -307,9 +307,10 @@ fun ComparatorScreen(
                 }
             }
 
-            // 8 Comparative Categories
+            // Comparative Categories (True GSI Blockers first, Shared Noise separated)
             item {
                 val sections = listOf(
+                    strings.compTrueGsiBlockers to comp.trueGsiBlockers.size,
                     strings.compDemonstratedBreaks to comp.demonstratedBreaks.size,
                     strings.compConfigsAndPatches to comp.configAndPatchDiffs.size,
                     strings.compMissingInGsi to comp.missingInGsi.size,
@@ -317,7 +318,8 @@ fun ComparatorScreen(
                     strings.compCommonDiffs to comp.commonComponentDiffs.size,
                     strings.compVersionInterfaces to comp.versionAndInterfaceDiffs.size,
                     strings.compIncompatibleLibs to comp.incompatibleLibsAndServices.size,
-                    strings.compSystemRemediation to comp.remediationOptions.size
+                    strings.compSystemRemediation to comp.remediationOptions.size,
+                    strings.compSharedNonBlockers to comp.sharedNonBlockingItems.size
                 )
                 Row(
                     modifier = Modifier
@@ -335,7 +337,7 @@ fun ComparatorScreen(
                 }
             }
 
-            if (activeSection == 7) {
+            if (activeSection == 8) {
                 items(comp.remediationOptions, key = { it.id }) { rem ->
                     TelemetrySectionCard {
                         Row(
@@ -367,13 +369,15 @@ fun ComparatorScreen(
                 }
             } else {
                 val entries: List<ComparisonEntry> = when (activeSection) {
-                    0 -> comp.demonstratedBreaks
-                    1 -> comp.configAndPatchDiffs
-                    2 -> comp.missingInGsi
-                    3 -> comp.missingLiveInteractions
-                    4 -> comp.commonComponentDiffs
-                    5 -> comp.versionAndInterfaceDiffs
-                    else -> comp.incompatibleLibsAndServices
+                    0 -> comp.trueGsiBlockers
+                    1 -> comp.demonstratedBreaks
+                    2 -> comp.configAndPatchDiffs
+                    3 -> comp.missingInGsi
+                    4 -> comp.missingLiveInteractions
+                    5 -> comp.commonComponentDiffs
+                    6 -> comp.versionAndInterfaceDiffs
+                    7 -> comp.incompatibleLibsAndServices
+                    else -> comp.sharedNonBlockingItems
                 }
                 items(entries) { item ->
                     TelemetrySectionCard {

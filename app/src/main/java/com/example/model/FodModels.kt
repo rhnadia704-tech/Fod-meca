@@ -139,7 +139,27 @@ data class RawArtifactsBundle(
     val sysfsFodNodes: String = "",
     val selinuxDenials: String = "",
     val initRcSnippets: String = "",
-    val elfDisassemblyFull: String = ""
+    val elfDisassemblyFull: String = "",
+    val dmesgDelta: String = "",
+    val surfaceFlingerLiveDelta: String = ""
+)
+
+@JsonClass(generateAdapter = true)
+data class FingerDownStep(
+    val order: Int,
+    val stage: String,
+    val status: EvidenceStatus,
+    val detail: String,
+    val evidence: String = ""
+)
+
+@JsonClass(generateAdapter = true)
+data class SysfsTransition(
+    val nodePath: String,
+    val beforeValue: String,
+    val liveValues: List<String> = emptyList(),
+    val afterValue: String,
+    val changed: Boolean
 )
 
 @JsonClass(generateAdapter = true)
@@ -183,7 +203,9 @@ data class FodDiagnosticReport(
     val elfAnalyses: List<ElfBinaryAnalysis>,
     val findings: List<InvestigationFinding>,
     val summary: DiagnosticSummary,
-    val rawArtifacts: RawArtifactsBundle
+    val rawArtifacts: RawArtifactsBundle,
+    val fingerDownChain: List<FingerDownStep> = emptyList(),
+    val sysfsTransitions: List<SysfsTransition> = emptyList()
 )
 
 @JsonClass(generateAdapter = true)
@@ -223,5 +245,7 @@ data class ComparisonResult(
     val missingLiveInteractions: List<ComparisonEntry>,
     val demonstratedBreaks: List<ComparisonEntry>,
     val remediationOptions: List<RemediationOption>,
-    val aiDeepComparisonMarkdown: String = ""
+    val aiDeepComparisonMarkdown: String = "",
+    val trueGsiBlockers: List<ComparisonEntry> = emptyList(),
+    val sharedNonBlockingItems: List<ComparisonEntry> = emptyList()
 )

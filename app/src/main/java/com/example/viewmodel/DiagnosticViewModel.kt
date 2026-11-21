@@ -59,7 +59,7 @@ data class ExportBannerState(
 class DiagnosticViewModel(application: Application) : AndroidViewModel(application) {
 
     private val probeCollector = SystemProbeCollector(application)
-    private val aiAnalyzer = GeminiFodAiAnalyzer()
+    private val aiAnalyzer = GeminiFodAiAnalyzer(application)
     private val sessionRepo = LocalSessionRepository(application)
 
     private val _selectedMode = MutableStateFlow(DiagnosticMode.ROM_FOD)
@@ -80,6 +80,8 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
     private var pendingBaseline: BaselineProbeResult? = null
     private var pendingElfs: List<ElfBinaryAnalysis> = emptyList()
     private var enrollmentStartedAtMs: Long = 0L
+    private val liveSysfsHistory = LinkedHashMap<String, MutableList<String>>()
+    private val liveSfLayers = LinkedHashSet<String>()
     private var livePollJob: Job? = null
 
     init {
@@ -107,6 +109,8 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
 
     fun startBaselineAndWaitForEnrollment(useRoot: Boolean) {
         livePollJob?.cancel()
+        liveSysfsHistory.clear()
+        liveSfLayers.clear()
         viewModelScope.launch {
             _capturePhase.value = CapturePhase.ScanningBaseline
             _aiState.value = AiSynthesisState.Idle
@@ -129,16 +133,19 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
                 )
 
                 livePollJob = viewModelScope.launch {
-                    var ticks = 0
-                    val regex = Regex("(fingerprint|biometric|udfps|fod|hbm|lhbm)", RegexOption.IGNORE_CASE)
                     while (isActive) {
                         delay(1500L)
-                        ticks += 2
-                        val snapshot = probeCollector.captureLiveEnrollmentLogs(effectiveRoot, durationCheckOnly = true)
-                        val count = snapshot.lineSequence().count { regex.containsMatchIn(it) }
+                        val poll = probeCollector.captureLivePollSnapshot(baseline, effectiveRoot)
+                        poll.sysfsValues.forEach { (node, valStr) ->
+                            val hist = liveSysfsHistory.getOrPut(node) { mutableListOf() }
+                            if (hist.lastOrNull() != valStr) {
+                                hist += valStr
+                            }
+                        }
+                        liveSfLayers.addAll(poll.surfaceFlingerFodLayers)
                         _capturePhase.value = CapturePhase.WaitingForEnrollment(
                             elapsedSeconds = ((System.currentTimeMillis() - enrollmentStartedAtMs) / 1000L).toInt(),
-                            observedLiveEvents = count,
+                            observedLiveEvents = poll.observedLogCount + poll.newDmesgCount + poll.surfaceFlingerFodLayers.size,
                             rootActive = effectiveRoot
                         )
                     }
@@ -155,6 +162,8 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
     fun cancelEnrollmentWait() {
         livePollJob?.cancel()
         pendingBaseline = null
+        liveSysfsHistory.clear()
+        liveSfLayers.clear()
         _capturePhase.value = CapturePhase.Idle
     }
 
@@ -169,17 +178,21 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
             _capturePhase.value = CapturePhase.AnalyzingSession
             try {
                 val duration = maxOf(0L, System.currentTimeMillis() - enrollmentStartedAtMs)
-                val liveLogs = probeCollector.captureLiveEnrollmentLogs(
-                    useRoot = baseline.environment.rootGranted,
-                    durationCheckOnly = false
+                val finalDiff = probeCollector.captureFinalSessionDiff(
+                    baseline = baseline,
+                    liveSysfsHistory = liveSysfsHistory.mapValues { it.value.toList() },
+                    liveObservedSfLayers = liveSfLayers.toSet()
                 )
                 val report = PatchAndArchitectureAnalyzer.buildReport(
                     mode = _selectedMode.value,
                     baseline = baseline,
-                    liveLogcat = liveLogs,
+                    liveLogcat = finalDiff.liveLogcat,
                     elfAnalyses = pendingElfs,
                     enrollmentDurationMs = duration,
-                    language = language
+                    language = language,
+                    dmesgDelta = finalDiff.dmesgDelta,
+                    surfaceFlingerLiveDelta = finalDiff.surfaceFlingerLiveDelta,
+                    sysfsTransitions = finalDiff.sysfsTransitions
                 )
                 sessionRepo.saveLatestReport(report)
                 _currentReport.value = report

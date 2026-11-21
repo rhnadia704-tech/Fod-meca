@@ -9,11 +9,13 @@ import com.example.model.DiagnosticSummary
 import com.example.model.DiscoveredComponent
 import com.example.model.ElfBinaryAnalysis
 import com.example.model.EvidenceStatus
+import com.example.model.FingerDownStep
 import com.example.model.FodDiagnosticReport
 import com.example.model.InvestigationFinding
 import com.example.model.KnowledgeLevel
 import com.example.model.RawArtifactsBundle
 import com.example.model.SessionEvent
+import com.example.model.SysfsTransition
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -27,7 +29,7 @@ object PatchAndArchitectureAnalyzer {
     )
 
     private val liveLogFilterRegex = Regex(
-        "(fingerprint|biometric|udfps|fod|hbm|lhbm|dimlayer|zorder|surfaceflinger|enroll|goodix|fpc|silead|focal|egis|synaptics|avc:\\s*denied)",
+        "(fingerprint|biometric|udfps|fod|hbm|lhbm|dimlayer|zorder|surfaceflinger|enroll|goodix|fpc|silead|focal|egis|synaptics|onacquired|onenrollresult|onfingerdown|onfingerup|avc:\\s*denied)",
         RegexOption.IGNORE_CASE
     )
 
@@ -37,7 +39,10 @@ object PatchAndArchitectureAnalyzer {
         liveLogcat: String,
         elfAnalyses: List<ElfBinaryAnalysis>,
         enrollmentDurationMs: Long,
-        language: AppLanguage
+        language: AppLanguage,
+        dmesgDelta: String = "",
+        surfaceFlingerLiveDelta: String = "",
+        sysfsTransitions: List<SysfsTransition> = emptyList()
     ): FodDiagnosticReport {
         val components = mutableListOf<DiscoveredComponent>()
         val edges = mutableListOf<DependencyEdge>()
@@ -61,59 +66,150 @@ object PatchAndArchitectureAnalyzer {
         // 5. Discover Overlays & Patches (exhaustively, never skipping any)
         discoverPatchesAndOverlays(baseline, propMap, patches, components)
 
-        // 6. Reconstruct real SESSION FLOW from live enrollment logcat
-        val sessionFlow = reconstructSessionFlow(liveLogcat, baseline.environment.rootGranted, language)
+        // 6. Reconstruct real SESSION FLOW from live enrollment logcat + kernel dmesg delta
+        val baseSessionFlow = reconstructSessionFlow(
+            liveLogcat = liveLogcat,
+            dmesgDelta = dmesgDelta,
+            rootGranted = baseline.environment.rootGranted,
+            language = language
+        ).toMutableList()
 
-        // 7. Build real Dependency Graph from discovered components
-        buildDependencyGraph(components, sessionFlow, edges)
+        // 7. Reconstruct stage-by-stage finger-down execution chain (T0 -> T_live -> T1)
+        val fingerDownChain = reconstructFingerDownChain(
+            baseline = baseline,
+            sessionFlow = baseSessionFlow,
+            liveLogcat = liveLogcat,
+            dmesgDelta = dmesgDelta,
+            surfaceFlingerLiveDelta = surfaceFlingerLiveDelta,
+            sysfsTransitions = sysfsTransitions,
+            enrollmentDurationMs = enrollmentDurationMs,
+            language = language
+        )
 
-        // 8. Analyze benign warnings vs real blocking failures
-        val blockingEvents = sessionFlow.filter { it.isBlockingFailure || it.status == EvidenceStatus.FAILED }
-        val benignEvents = sessionFlow.filter { it.isBenignWarning }
-        val enrollSuccess = sessionFlow.any {
-            it.rawEvidence.contains("remaining=0", true) ||
-                it.rawEvidence.contains("onEnrollResult", true) && it.rawEvidence.contains("0") ||
-                it.rawEvidence.contains("enroll_complete", true)
+        // 8. Analyze completion vs explicit failure vs SILENT HAL STALL
+        val blockingEvents = baseSessionFlow.filter { it.isBlockingFailure || it.status == EvidenceStatus.FAILED }
+        val benignEvents = baseSessionFlow.filter { it.isBenignWarning }
+
+        val enrollSuccess = baseSessionFlow.any {
+            val ev = it.rawEvidence.lowercase()
+            ev.contains("remaining=0") ||
+                (ev.contains("onenrollresult") && Regex("remaining[=:\\s]+0\\b").containsMatchIn(ev)) ||
+                ev.contains("enroll_complete")
         }
-        val enrollFailed = blockingEvents.isNotEmpty() || sessionFlow.any {
-            it.rawEvidence.contains("onError", true) ||
-                it.rawEvidence.contains("ERROR_TIMEOUT", true) ||
-                it.rawEvidence.contains("ERROR_HW_UNAVAILABLE", true) ||
-                it.rawEvidence.contains("ERROR_UNABLE_TO_PROCESS", true)
+        val halProgressSeen = baseSessionFlow.any {
+            val ev = it.rawEvidence.lowercase()
+            ev.contains("onacquired") || ev.contains("onenrollresult")
+        }
+        val explicitFailure = blockingEvents.isNotEmpty() || baseSessionFlow.any {
+            val ev = it.rawEvidence.lowercase()
+            ev.contains("onerror") ||
+                ev.contains("error_timeout") ||
+                ev.contains("error_hw_unavailable") ||
+                ev.contains("error_unable_to_process")
         }
 
-        // Evaluate patches real effect based on live session & dumpsys
-        val evaluatedPatches = evaluatePatchesRealEffect(patches, sessionFlow, baseline, language)
+        val fodUiOrLightActive = fingerDownChain.any {
+            (it.order == 1 || it.order == 2 || it.order == 3) &&
+                (it.status == EvidenceStatus.CONFIRMED || it.status == EvidenceStatus.OBSERVED)
+        } || sysfsTransitions.any { it.changed } ||
+            (!surfaceFlingerLiveDelta.startsWith("NO_NEW") && !surfaceFlingerLiveDelta.startsWith("SURFACEFLINGER_LIVE_UNAVAILABLE") && surfaceFlingerLiveDelta.isNotBlank()) ||
+            enrollmentDurationMs >= 3000L
 
-        // Generate Epistemic Investigation Findings
+        val silentHalStall = !enrollSuccess && !explicitFailure && !halProgressSeen && fodUiOrLightActive
+
+        val finalChain = if (silentHalStall) {
+            fingerDownChain.map { step ->
+                if (step.order == 5 && step.status != EvidenceStatus.CONFIRMED) {
+                    step.copy(
+                        status = EvidenceStatus.FAILED,
+                        detail = if (language == AppLanguage.FR) {
+                            "BLOCAGE SILENCIEUX HAL : lumière/UI FOD active mais aucun retour onAcquired / onEnrollResult / onError."
+                        } else {
+                            "SILENT HAL STALL: FOD light/UI active yet zero onAcquired / onEnrollResult / onError callbacks."
+                        }
+                    )
+                } else {
+                    step
+                }
+            }
+        } else {
+            fingerDownChain
+        }
+
+        if (silentHalStall) {
+            baseSessionFlow += SessionEvent(
+                id = "evt_silent_hal_stall",
+                timestamp = "T1",
+                relativeMs = enrollmentDurationMs,
+                phase = "HAL_EXEC",
+                component = "VendorFingerprintHAL / UdfpsSync",
+                summary = if (language == AppLanguage.FR) {
+                    "Blocage silencieux détecté : la zone/lumière FOD était active (${enrollmentDurationMs}ms), mais le HAL n'a émis ni progression (onAcquired/onEnrollResult) ni erreur (onError)."
+                } else {
+                    "Silent stall detected: FOD light/UI was active (${enrollmentDurationMs}ms), yet HAL emitted neither progress (onAcquired/onEnrollResult) nor error (onError)."
+                },
+                rawEvidence = "SILENT_HAL_STALL durationMs=$enrollmentDurationMs sysfsChanged=${sysfsTransitions.count { it.changed }} dmesgDelta=${dmesgDelta.lines().size}",
+                status = EvidenceStatus.FAILED,
+                knowledgeLevel = KnowledgeLevel.FACT,
+                isBenignWarning = false,
+                isBlockingFailure = true
+            )
+        }
+
+        val effectiveFailed = explicitFailure || silentHalStall
+        val effectiveSuccess = enrollSuccess && !effectiveFailed
+
+        // 9. Build real Dependency Graph from discovered components
+        buildDependencyGraph(components, baseSessionFlow, edges)
+
+        // 10. Evaluate patches real effect based on live session & dumpsys
+        val evaluatedPatches = evaluatePatchesRealEffect(patches, baseSessionFlow, silentHalStall, language)
+
+        // 11. Generate Epistemic Investigation Findings
         buildFindings(
             baseline = baseline,
             components = components,
             patches = evaluatedPatches,
             elfAnalyses = elfAnalyses,
-            sessionFlow = sessionFlow,
+            sessionFlow = baseSessionFlow,
+            fingerDownChain = finalChain,
+            sysfsTransitions = sysfsTransitions,
             findings = findings,
             language = language
         )
 
         val confirmedCount = components.count { it.status == EvidenceStatus.CONFIRMED } +
-            sessionFlow.count { it.status == EvidenceStatus.CONFIRMED }
+            baseSessionFlow.count { it.status == EvidenceStatus.CONFIRMED }
         val observedCount = components.count { it.status == EvidenceStatus.OBSERVED } +
-            sessionFlow.count { it.status == EvidenceStatus.OBSERVED }
+            baseSessionFlow.count { it.status == EvidenceStatus.OBSERVED }
         val suspectCount = components.count { it.status == EvidenceStatus.SUSPECT } +
-            sessionFlow.count { it.status == EvidenceStatus.SUSPECT }
+            baseSessionFlow.count { it.status == EvidenceStatus.SUSPECT }
         val failedCount = components.count { it.status == EvidenceStatus.FAILED } +
-            sessionFlow.count { it.status == EvidenceStatus.FAILED }
+            baseSessionFlow.count { it.status == EvidenceStatus.FAILED }
         val unknownCount = components.count { it.status == EvidenceStatus.UNKNOWN } +
-            sessionFlow.count { it.status == EvidenceStatus.UNKNOWN }
+            baseSessionFlow.count { it.status == EvidenceStatus.UNKNOWN }
 
-        val firstBreak = blockingEvents.firstOrNull()?.let {
-            "[${it.phase}] ${it.component}: ${it.summary} (${it.rawEvidence.take(160)})"
-        } ?: if (components.any { it.status == EvidenceStatus.FAILED }) {
-            val c = components.first { it.status == EvidenceStatus.FAILED }
-            "[${c.category}] ${c.name}: ${c.accessNote ?: c.path}"
-        } else {
-            if (language == AppLanguage.FR) {
+        val updatedBlocking = baseSessionFlow.filter { it.isBlockingFailure || it.status == EvidenceStatus.FAILED }
+        val firstBreak = when {
+            silentHalStall -> {
+                val lastOk = finalChain.lastOrNull { it.status == EvidenceStatus.CONFIRMED || it.status == EvidenceStatus.OBSERVED }
+                val firstBroken = finalChain.firstOrNull { it.status == EvidenceStatus.FAILED || it.status == EvidenceStatus.SUSPECT }
+                    ?: finalChain.lastOrNull()
+                if (language == AppLanguage.FR) {
+                    "Dernière étape confirmée : [${lastOk?.stage ?: "UI/FOD"}] → Rupture silencieuse à [${firstBroken?.stage ?: "HAL"}] : ${firstBroken?.detail.orEmpty()}"
+                } else {
+                    "Last confirmed stage: [${lastOk?.stage ?: "UI/FOD"}] → Silent break at [${firstBroken?.stage ?: "HAL"}]: ${firstBroken?.detail.orEmpty()}"
+                }
+            }
+            updatedBlocking.isNotEmpty() -> {
+                val blk = updatedBlocking.first()
+                "[${blk.phase}] ${blk.component}: ${blk.summary} (${blk.rawEvidence.take(160)})"
+            }
+            components.any { it.status == EvidenceStatus.FAILED } -> {
+                val c = components.first { it.status == EvidenceStatus.FAILED }
+                "[${c.category}] ${c.name}: ${c.accessNote ?: c.path}"
+            }
+            else -> if (language == AppLanguage.FR) {
                 "Aucune rupture bloquante démontrée dans les traces accessibles."
             } else {
                 "No blocking break demonstrated within accessible traces."
@@ -121,44 +217,61 @@ object PatchAndArchitectureAnalyzer {
         }
 
         val noiseNote = when {
-            enrollSuccess && benignEvents.isNotEmpty() -> {
+            effectiveSuccess && benignEvents.isNotEmpty() -> {
                 if (language == AppLanguage.FR) {
                     "Enregistrement réussi malgré ${benignEvents.size} avertissement(s) non bloquant(s) observé(s) dans les logs."
                 } else {
                     "Enrollment succeeded despite ${benignEvents.size} non-blocking warning(s) observed in logs."
                 }
             }
-            enrollFailed && benignEvents.isNotEmpty() -> {
+            silentHalStall -> {
                 if (language == AppLanguage.FR) {
-                    "${benignEvents.size} avertissement(s) bénin(s) et ${blockingEvents.size} rupture(s) bloquante(s) observés."
+                    "Échec silencieux caractérisé : la lumière FOD réagit, mais la chaîne HBM/Touch/HAL ne transmet aucun événement d'acquisition au framework."
                 } else {
-                    "${benignEvents.size} benign warning(s) and ${blockingEvents.size} blocking break(s) observed."
+                    "Characterized silent stall: FOD light activates, but the HBM/Touch/HAL chain delivers zero acquisition callbacks to the framework."
+                }
+            }
+            effectiveFailed && benignEvents.isNotEmpty() -> {
+                if (language == AppLanguage.FR) {
+                    "${benignEvents.size} avertissement(s) bénin(s) et ${updatedBlocking.size} rupture(s) bloquante(s) observés."
+                } else {
+                    "${benignEvents.size} benign warning(s) and ${updatedBlocking.size} blocking break(s) observed."
                 }
             }
             else -> {
                 if (language == AppLanguage.FR) {
-                    "Distinction effectuée entre bruit système toléré et erreurs fatales."
+                    "Distinction effectuée entre bruit système toléré et ruptures réelles."
                 } else {
-                    "Separated tolerated system log noise from fatal breaks."
+                    "Separated tolerated system log noise from real breaks."
                 }
             }
         }
 
         val overallOutcome = when {
-            sessionFlow.isEmpty() -> if (language == AppLanguage.FR) {
+            silentHalStall -> if (language == AppLanguage.FR) {
+                "BLOCAGE SILENCIEUX DÉTECTÉ (AUCUN RETOUR HAL)"
+            } else {
+                "SILENT HAL STALL DETECTED (NO HAL RESPONSE)"
+            }
+            baseSessionFlow.isEmpty() -> if (language == AppLanguage.FR) {
                 "INCOMPLET / TRACE LIVE RESTREINTE"
             } else {
                 "INCOMPLETE / RESTRICTED LIVE TRACE"
             }
-            enrollSuccess && !enrollFailed -> if (language == AppLanguage.FR) {
+            effectiveSuccess -> if (language == AppLanguage.FR) {
                 "SUCCÈS D'ENREGISTREMENT OBSERVÉ"
             } else {
                 "ENROLLMENT SUCCESS OBSERVED"
             }
-            enrollFailed -> if (language == AppLanguage.FR) {
+            effectiveFailed -> if (language == AppLanguage.FR) {
                 "BLOCAGE RÉEL DÉTECTÉ"
             } else {
                 "REAL ENROLLMENT BLOCK DETECTED"
+            }
+            halProgressSeen -> if (language == AppLanguage.FR) {
+                "ACQUISITION PARTIELLE OBSERVÉE (NON TERMINÉE)"
+            } else {
+                "PARTIAL ACQUISITION OBSERVED (INCOMPLETE)"
             }
             else -> if (language == AppLanguage.FR) {
                 "SESSION OBSERVÉE (ÉTAT INTERMÉDIAIRE)"
@@ -193,7 +306,7 @@ object PatchAndArchitectureAnalyzer {
             createdAtIso = nowIso,
             enrollmentDurationMs = enrollmentDurationMs,
             environment = baseline.environment,
-            sessionFlow = sessionFlow,
+            sessionFlow = baseSessionFlow,
             components = components.distinctBy { it.id },
             dependencyEdges = edges,
             patches = evaluatedPatches,
@@ -201,10 +314,10 @@ object PatchAndArchitectureAnalyzer {
             findings = findings,
             summary = DiagnosticSummary(
                 overallOutcome = overallOutcome,
-                enrollmentObserved = sessionFlow.isNotEmpty(),
+                enrollmentObserved = baseSessionFlow.isNotEmpty() || sysfsTransitions.any { it.changed } || enrollmentDurationMs >= 3000L,
                 enrollmentSucceeded = when {
-                    enrollSuccess && !enrollFailed -> true
-                    enrollFailed -> false
+                    effectiveSuccess -> true
+                    effectiveFailed -> false
                     else -> null
                 },
                 realSuccessDespiteNoiseNote = noiseNote,
@@ -230,9 +343,178 @@ object PatchAndArchitectureAnalyzer {
                 sysfsFodNodes = baseline.sysfsFodNodes,
                 selinuxDenials = baseline.selinuxDenials,
                 initRcSnippets = baseline.initRcSnippets,
-                elfDisassemblyFull = fullElfText
-            )
+                elfDisassemblyFull = fullElfText,
+                dmesgDelta = dmesgDelta,
+                surfaceFlingerLiveDelta = surfaceFlingerLiveDelta
+            ),
+            fingerDownChain = finalChain,
+            sysfsTransitions = sysfsTransitions
         )
+    }
+
+    private fun reconstructFingerDownChain(
+        baseline: BaselineProbeResult,
+        sessionFlow: List<SessionEvent>,
+        liveLogcat: String,
+        dmesgDelta: String,
+        surfaceFlingerLiveDelta: String,
+        sysfsTransitions: List<SysfsTransition>,
+        enrollmentDurationMs: Long,
+        language: AppLanguage
+    ): List<FingerDownStep> {
+        val logLower = liveLogcat.lowercase()
+        val dmesgLower = dmesgDelta.lowercase()
+        val sfLower = surfaceFlingerLiveDelta.lowercase()
+
+        // 1. Biometric / Enrollment client active
+        val enrollEvt = sessionFlow.firstOrNull {
+            it.phase == "ENROLLMENT" ||
+                it.rawEvidence.contains("startPreparedClient", true) ||
+                it.rawEvidence.contains("enroll(", true)
+        }
+        val step1 = FingerDownStep(
+            order = 1,
+            stage = if (language == AppLanguage.FR) "1. Client Enrôlement (Framework)" else "1. Enrollment Client (Framework)",
+            status = when {
+                enrollEvt != null -> EvidenceStatus.CONFIRMED
+                enrollmentDurationMs >= 2500L -> EvidenceStatus.OBSERVED
+                else -> EvidenceStatus.UNKNOWN
+            },
+            detail = when {
+                enrollEvt != null -> enrollEvt.summary
+                enrollmentDurationMs >= 2500L -> if (language == AppLanguage.FR) {
+                    "Session d'enrôlement active (${enrollmentDurationMs}ms) sans trace explicite startPreparedClient dans le tampon."
+                } else {
+                    "Enrollment session active (${enrollmentDurationMs}ms) without explicit startPreparedClient line in buffer."
+                }
+                else -> if (language == AppLanguage.FR) "Aucune activité d'enrôlement observée." else "No enrollment activity observed."
+            },
+            evidence = enrollEvt?.rawEvidence.orEmpty()
+        )
+
+        // 2. FOD Overlay / SurfaceFlinger illumination layer
+        val fodUiEvt = sessionFlow.firstOrNull {
+            it.phase == "FOD_OVERLAY" ||
+                it.rawEvidence.contains("udfps", true) ||
+                it.rawEvidence.contains("dimlayer", true) ||
+                it.rawEvidence.contains("BiometricPrompt", true)
+        }
+        val hasSfLayer = sfLower.contains("udfps") || sfLower.contains("fod") || sfLower.contains("dim") || sfLower.contains("fingerprint")
+        val step2 = FingerDownStep(
+            order = 2,
+            stage = if (language == AppLanguage.FR) "2. UI / Lumière FOD (SystemUI & SurfaceFlinger)" else "2. FOD UI / Illumination (SystemUI & SurfaceFlinger)",
+            status = when {
+                fodUiEvt?.isBlockingFailure == true -> EvidenceStatus.FAILED
+                fodUiEvt != null || hasSfLayer -> EvidenceStatus.CONFIRMED
+                enrollmentDurationMs >= 3000L -> EvidenceStatus.OBSERVED
+                else -> EvidenceStatus.UNKNOWN
+            },
+            detail = when {
+                fodUiEvt != null -> fodUiEvt.summary
+                hasSfLayer -> "SurfaceFlinger delta: ${surfaceFlingerLiveDelta.lines().take(3).joinToString(" | ")}"
+                enrollmentDurationMs >= 3000L -> if (language == AppLanguage.FR) {
+                    "Zone lumineuse FOD activée visuellement pendant la session (couche non capturée dans les tampons)."
+                } else {
+                    "FOD illumination zone active during session (layer not captured in buffers)."
+                }
+                else -> if (language == AppLanguage.FR) "Couche FOD non observée." else "FOD layer not observed."
+            },
+            evidence = (fodUiEvt?.rawEvidence ?: surfaceFlingerLiveDelta).take(220)
+        )
+
+        // 3. HBM / Sysfs node transition
+        val changedSysfs = sysfsTransitions.filter { it.changed }
+        val hbmEvt = sessionFlow.firstOrNull {
+            it.phase == "DISPLAY_HBM" || logLower.contains("hbm") || logLower.contains("lhbm") || logLower.contains("disp_param")
+        }
+        val sysfsDenied = dmesgLower.contains("avc: denied") && (dmesgLower.contains("sysfs") || dmesgLower.contains("drm") || dmesgLower.contains("fod"))
+        val step3 = FingerDownStep(
+            order = 3,
+            stage = if (language == AppLanguage.FR) "3. HBM / Nœuds sysfs DRM & Touch" else "3. Display HBM / DRM & Touch Sysfs",
+            status = when {
+                sysfsDenied || hbmEvt?.isBlockingFailure == true -> EvidenceStatus.FAILED
+                changedSysfs.isNotEmpty() || hbmEvt?.status == EvidenceStatus.CONFIRMED -> EvidenceStatus.CONFIRMED
+                sysfsTransitions.isNotEmpty() -> EvidenceStatus.SUSPECT
+                else -> EvidenceStatus.UNKNOWN
+            },
+            detail = when {
+                sysfsDenied -> if (language == AppLanguage.FR) "Accès HBM/sysfs bloqué par SELinux." else "HBM/sysfs access blocked by SELinux."
+                changedSysfs.isNotEmpty() -> changedSysfs.take(4).joinToString(" | ") { "${it.nodePath.substringAfterLast('/')}: ${it.beforeValue} -> ${it.afterValue}" }
+                hbmEvt != null -> hbmEvt.summary
+                sysfsTransitions.isNotEmpty() -> if (language == AppLanguage.FR) {
+                    "${sysfsTransitions.size} nœuds sysfs surveillés mais AUCUNE transition observée pendant l'appui doigt !"
+                } else {
+                    "${sysfsTransitions.size} sysfs nodes polled yet ZERO state transitions observed during finger touch!"
+                }
+                else -> if (language == AppLanguage.FR) "Nœuds sysfs non lisibles (${if (baseline.environment.rootGranted) "aucun découvert" else "root désactivé"})." else "Sysfs nodes unreadable."
+            },
+            evidence = changedSysfs.joinToString("\n") { "${it.nodePath}: ${it.beforeValue} -> ${it.liveValues} -> ${it.afterValue}" }.take(240)
+        )
+
+        // 4. Kernel driver / dmesg events
+        val kernelLines = if (!dmesgDelta.startsWith("DMESG_UNAVAILABLE") && !dmesgDelta.startsWith("NO_NEW_FOD")) {
+            dmesgDelta.lines().filter { it.isNotBlank() }
+        } else {
+            emptyList()
+        }
+        val kernelError = kernelLines.any { it.contains("fail", true) || it.contains("err", true) || it.contains("avc: denied", true) }
+        val step4 = FingerDownStep(
+            order = 4,
+            stage = if (language == AppLanguage.FR) "4. Noyau / Pilote Touch-FOD (dmesg)" else "4. Kernel / Touch-FOD Driver (dmesg)",
+            status = when {
+                !baseline.environment.rootGranted -> EvidenceStatus.UNKNOWN
+                kernelError -> EvidenceStatus.FAILED
+                kernelLines.isNotEmpty() -> EvidenceStatus.CONFIRMED
+                else -> EvidenceStatus.SUSPECT
+            },
+            detail = when {
+                !baseline.environment.rootGranted -> if (language == AppLanguage.FR) "dmesg inaccessible sans Root." else "dmesg unavailable without Root."
+                kernelLines.isNotEmpty() -> "${kernelLines.size} événement(s) kernel capturés pendant l'appui."
+                else -> if (language == AppLanguage.FR) {
+                    "Aucun événement kernel FOD/goodix/touch_dev/hbm émis dans dmesg pendant l'appui du doigt."
+                } else {
+                    "Zero FOD/goodix/touch_dev/hbm kernel events emitted in dmesg during finger touch."
+                }
+            },
+            evidence = kernelLines.take(5).joinToString("\n").take(260)
+        )
+
+        // 5. Vendor Fingerprint HAL callbacks
+        val onFingerDownSeen = logLower.contains("onfingerdown") || logLower.contains("fod_press") || logLower.contains("extcmd")
+        val onAcquiredSeen = logLower.contains("onacquired")
+        val onEnrollResultSeen = logLower.contains("onenrollresult")
+        val onErrorEvent = sessionFlow.firstOrNull { it.isBlockingFailure || it.rawEvidence.contains("onError", true) }
+        val step5 = FingerDownStep(
+            order = 5,
+            stage = if (language == AppLanguage.FR) "5. HAL Biométrique Vendor & Callbacks" else "5. Vendor Biometric HAL & Callbacks",
+            status = when {
+                onEnrollResultSeen || onAcquiredSeen -> EvidenceStatus.CONFIRMED
+                onErrorEvent != null -> EvidenceStatus.FAILED
+                onFingerDownSeen -> EvidenceStatus.SUSPECT
+                else -> EvidenceStatus.UNKNOWN
+            },
+            detail = when {
+                onEnrollResultSeen -> if (language == AppLanguage.FR) "onEnrollResult observé : capture complétée par le HAL." else "onEnrollResult observed: capture completed by HAL."
+                onAcquiredSeen -> if (language == AppLanguage.FR) "onAcquired observé : le HAL capte le doigt." else "onAcquired observed: HAL receives finger signal."
+                onErrorEvent != null -> onErrorEvent.summary
+                onFingerDownSeen -> if (language == AppLanguage.FR) {
+                    "onFingerDown envoyé au HAL mais aucun onAcquired/onEnrollResult reçu en retour."
+                } else {
+                    "onFingerDown sent to HAL yet zero onAcquired/onEnrollResult returned."
+                }
+                else -> if (language == AppLanguage.FR) {
+                    "Aucun signal onFingerDown / onAcquired / onEnrollResult observé côté HAL."
+                } else {
+                    "No onFingerDown / onAcquired / onEnrollResult signal observed from HAL."
+                }
+            },
+            evidence = sessionFlow.filter {
+                val r = it.rawEvidence.lowercase()
+                r.contains("onfingerdown") || r.contains("onacquired") || r.contains("onenrollresult") || r.contains("onerror")
+            }.take(4).joinToString("\n") { it.rawEvidence }.take(260)
+        )
+
+        return listOf(step1, step2, step3, step4, step5)
     }
 
     private fun discoverHalComponents(
@@ -435,7 +717,6 @@ object PatchAndArchitectureAnalyzer {
         patches: MutableList<DetectedPatch>,
         components: MutableList<DiscoveredComponent>
     ) {
-        // Every FOD/Treble/GSI/Vendor property detected
         propMap.entries
             .filter { patchPropRegex.matches(it.key) || it.key.contains("fod", true) || it.key.contains("udfps", true) || it.key.contains("phh", true) }
             .forEachIndexed { idx, (k, v) ->
@@ -463,7 +744,6 @@ object PatchAndArchitectureAnalyzer {
                 )
             }
 
-        // Every RRO overlay from cmd overlay list & installed packages
         baseline.dumpsysOverlay.lineSequence()
             .filter {
                 val l = it.lowercase()
@@ -515,7 +795,6 @@ object PatchAndArchitectureAnalyzer {
             }
         }
 
-        // Init.rc FOD/fingerprint triggers
         baseline.initRcSnippets.lineSequence()
             .filter { it.isNotBlank() }
             .take(40)
@@ -536,86 +815,90 @@ object PatchAndArchitectureAnalyzer {
 
     private fun reconstructSessionFlow(
         liveLogcat: String,
+        dmesgDelta: String,
         rootGranted: Boolean,
         language: AppLanguage
     ): List<SessionEvent> {
-        if (liveLogcat.isBlank() || liveLogcat.startsWith("LOGCAT_UNAVAILABLE")) {
-            return listOf(
-                SessionEvent(
-                    id = "flow_unavail",
-                    timestamp = "N/A",
-                    relativeMs = 0L,
-                    phase = "CAPTURE",
-                    component = "logcat",
-                    summary = if (language == AppLanguage.FR) {
-                        "Journaux système non accessibles (${liveLogcat.take(100)}). Aucun événement inventé."
-                    } else {
-                        "System logs inaccessible (${liveLogcat.take(100)}). No events fabricated."
-                    },
-                    rawEvidence = liveLogcat,
-                    status = EvidenceStatus.UNKNOWN,
-                    knowledgeLevel = KnowledgeLevel.FACT
+        val events = mutableListOf<SessionEvent>()
+
+        if (!liveLogcat.isBlank() && !liveLogcat.startsWith("LOGCAT_UNAVAILABLE")) {
+            val filteredLines = liveLogcat.lineSequence()
+                .filter { liveLogFilterRegex.containsMatchIn(it) }
+                .toList()
+
+            filteredLines.takeLast(240).forEachIndexed { idx, line ->
+                val lower = line.lowercase()
+                val timestamp = line.take(18).trim()
+                val phase = when {
+                    lower.contains("enroll") || lower.contains("biometricprompt") -> "ENROLLMENT"
+                    lower.contains("udfps") || lower.contains("fod") -> "FOD_OVERLAY"
+                    lower.contains("hbm") || lower.contains("lhbm") || lower.contains("surfaceflinger") || lower.contains("dim") -> "DISPLAY_HBM"
+                    lower.contains("avc:") -> "SELINUX"
+                    lower.contains("hal") || lower.contains("goodix") || lower.contains("fpc") || lower.contains("silead") || lower.contains("onacquired") || lower.contains("onenrollresult") -> "HAL_EXEC"
+                    else -> "BIOMETRIC_SVC"
+                }
+
+                val isBenignNoise = (lower.contains(" w ") || lower.contains("warning") ||
+                    lower.contains("deprecated") || (lower.contains("not found") && !lower.contains("hal"))) &&
+                    !lower.contains("fatal") && !lower.contains("deadobject") && !lower.contains("avc: denied")
+
+                val isBlocking = (lower.contains("avc: denied") && (lower.contains("fingerprint") || lower.contains("fod") || lower.contains("hbm") || lower.contains("sysfs"))) ||
+                    lower.contains("deadobjectexception") ||
+                    lower.contains("error_hw_unavailable") ||
+                    lower.contains("error_unable_to_process") ||
+                    lower.contains("failed to open") ||
+                    (lower.contains("permission denied") && (lower.contains("fod") || lower.contains("hbm") || lower.contains("fingerprint"))) ||
+                    lower.contains("hal died") ||
+                    lower.contains("null sensor")
+
+                val isConfirmed = lower.contains("onacquired") ||
+                    lower.contains("onenrollresult") ||
+                    lower.contains("onfingerdown") ||
+                    lower.contains("onfingerup") ||
+                    lower.contains("hbm enable") ||
+                    (lower.contains("lhbm") && !lower.contains("fail") && !lower.contains("error"))
+
+                val status = when {
+                    isBlocking -> EvidenceStatus.FAILED
+                    isConfirmed -> EvidenceStatus.CONFIRMED
+                    isBenignNoise -> EvidenceStatus.SUSPECT
+                    else -> EvidenceStatus.OBSERVED
+                }
+
+                events += SessionEvent(
+                    id = "evt_$idx",
+                    timestamp = timestamp,
+                    relativeMs = idx * 10L,
+                    phase = phase,
+                    component = extractTagFromLogLine(line),
+                    summary = line.substringAfter(":", line).trim().take(160),
+                    rawEvidence = line,
+                    status = status,
+                    knowledgeLevel = KnowledgeLevel.FACT,
+                    isBenignWarning = isBenignNoise,
+                    isBlockingFailure = isBlocking
                 )
-            )
+            }
         }
 
-        val events = mutableListOf<SessionEvent>()
-        val filteredLines = liveLogcat.lineSequence()
-            .filter { liveLogFilterRegex.containsMatchIn(it) }
-            .toList()
-
-        filteredLines.takeLast(220).forEachIndexed { idx, line ->
-            val lower = line.lowercase()
-            val timestamp = line.take(18).trim()
-            val phase = when {
-                lower.contains("enroll") || lower.contains("biometricprompt") -> "ENROLLMENT"
-                lower.contains("udfps") || lower.contains("fod") -> "FOD_OVERLAY"
-                lower.contains("hbm") || lower.contains("lhbm") || lower.contains("surfaceflinger") || lower.contains("dim") -> "DISPLAY_HBM"
-                lower.contains("avc:") -> "SELINUX"
-                lower.contains("hal") || lower.contains("goodix") || lower.contains("fpc") || lower.contains("silead") -> "HAL_EXEC"
-                else -> "BIOMETRIC_SVC"
+        if (dmesgDelta.isNotBlank() && !dmesgDelta.startsWith("DMESG_UNAVAILABLE") && !dmesgDelta.startsWith("NO_NEW_FOD")) {
+            dmesgDelta.lines().filter { it.isNotBlank() }.take(80).forEachIndexed { idx, line ->
+                val lower = line.lowercase()
+                val isBlocking = lower.contains("avc: denied") || lower.contains("fail") || lower.contains("timeout")
+                events += SessionEvent(
+                    id = "dmesg_evt_$idx",
+                    timestamp = "KERNEL",
+                    relativeMs = 5000L + idx * 10L,
+                    phase = if (lower.contains("avc:")) "SELINUX" else "KERNEL_DRIVER",
+                    component = "dmesg",
+                    summary = line.take(160),
+                    rawEvidence = line,
+                    status = if (isBlocking) EvidenceStatus.FAILED else EvidenceStatus.CONFIRMED,
+                    knowledgeLevel = KnowledgeLevel.FACT,
+                    isBenignWarning = false,
+                    isBlockingFailure = isBlocking
+                )
             }
-
-            val isBenignNoise = (lower.contains(" w ") || lower.contains("warning") ||
-                lower.contains("deprecated") || lower.contains("not found") && !lower.contains("hal")) &&
-                !lower.contains("fatal") && !lower.contains("deadobject") && !lower.contains("avc: denied")
-
-            val isBlocking = lower.contains("avc: denied") && (lower.contains("fingerprint") || lower.contains("fod") || lower.contains("hbm") || lower.contains("sysfs")) ||
-                lower.contains("deadobjectexception") ||
-                lower.contains("error_hw_unavailable") ||
-                lower.contains("error_unable_to_process") ||
-                lower.contains("failed to open") ||
-                lower.contains("permission denied") && (lower.contains("fod") || lower.contains("hbm") || lower.contains("fingerprint")) ||
-                lower.contains("hal died") ||
-                lower.contains("null sensor")
-
-            val isConfirmed = lower.contains("onacquired") ||
-                lower.contains("onenrollresult") ||
-                lower.contains("onfingerdown") ||
-                lower.contains("onfingerup") ||
-                lower.contains("hbm enable") ||
-                lower.contains("lhbm") && !lower.contains("fail") && !lower.contains("error")
-
-            val status = when {
-                isBlocking -> EvidenceStatus.FAILED
-                isConfirmed -> EvidenceStatus.CONFIRMED
-                isBenignNoise -> EvidenceStatus.SUSPECT
-                else -> EvidenceStatus.OBSERVED
-            }
-
-            events += SessionEvent(
-                id = "evt_$idx",
-                timestamp = timestamp,
-                relativeMs = idx * 10L,
-                phase = phase,
-                component = extractTagFromLogLine(line),
-                summary = line.substringAfter(":", line).trim().take(160),
-                rawEvidence = line,
-                status = status,
-                knowledgeLevel = KnowledgeLevel.FACT,
-                isBenignWarning = isBenignNoise,
-                isBlockingFailure = isBlocking
-            )
         }
 
         if (events.isEmpty()) {
@@ -626,11 +909,11 @@ object PatchAndArchitectureAnalyzer {
                 phase = "CAPTURE",
                 component = if (rootGranted) "logcat" else "app_sandbox",
                 summary = if (language == AppLanguage.FR) {
-                    "Aucun événement FOD visible dans les tampons accessibles (sans root/READ_LOGS, Android isole les logs d'autres UID)."
+                    "Aucun événement FOD visible dans les tampons capturés."
                 } else {
-                    "No FOD events visible in accessible log buffers (without root/READ_LOGS, Android isolates cross-UID logs)."
+                    "No FOD events visible in captured buffers."
                 },
-                rawEvidence = "Filtered 0 FOD lines from ${liveLogcat.lines().size} accessible lines",
+                rawEvidence = liveLogcat.take(200),
                 status = EvidenceStatus.UNKNOWN,
                 knowledgeLevel = KnowledgeLevel.FACT
             )
@@ -647,19 +930,19 @@ object PatchAndArchitectureAnalyzer {
     private fun evaluatePatchesRealEffect(
         patches: List<DetectedPatch>,
         sessionFlow: List<SessionEvent>,
-        baseline: BaselineProbeResult,
+        silentHalStall: Boolean,
         language: AppLanguage
     ): List<DetectedPatch> {
         val hasHbmEvent = sessionFlow.any { it.phase == "DISPLAY_HBM" && it.status == EvidenceStatus.CONFIRMED }
         val hasFodOverlay = sessionFlow.any { it.phase == "FOD_OVERLAY" && it.status == EvidenceStatus.CONFIRMED }
-        val hasBlocking = sessionFlow.any { it.isBlockingFailure }
+        val hasBlocking = silentHalStall || sessionFlow.any { it.isBlockingFailure }
 
         return patches.map { p ->
             val effect = when {
+                p.name.contains("phh", true) && hasBlocking ->
+                    if (language == AppLanguage.FR) "Présent mais n'empêche pas le blocage observé." else "Present, yet did not prevent the observed stall/break."
                 p.name.contains("hbm", true) && hasHbmEvent ->
                     if (language == AppLanguage.FR) "Corrélé avec une activation HBM observée." else "Correlated with observed HBM activation."
-                p.name.contains("phh", true) && hasBlocking ->
-                    if (language == AppLanguage.FR) "Présent mais n'empêche pas la rupture bloquante observée." else "Present, yet did not prevent the observed blocking break."
                 p.scope == "RRO Overlay" && p.rawValue == "ENABLED" && hasFodOverlay ->
                     if (language == AppLanguage.FR) "Overlay actif pendant la session FOD." else "Overlay active during FOD session."
                 else -> p.realObservedEffect
@@ -755,6 +1038,8 @@ object PatchAndArchitectureAnalyzer {
         patches: List<DetectedPatch>,
         elfAnalyses: List<ElfBinaryAnalysis>,
         sessionFlow: List<SessionEvent>,
+        fingerDownChain: List<FingerDownStep>,
+        sysfsTransitions: List<SysfsTransition>,
         findings: MutableList<InvestigationFinding>,
         language: AppLanguage
     ) {
@@ -764,6 +1049,16 @@ object PatchAndArchitectureAnalyzer {
             detail = "Device=${baseline.environment.deviceModel}, GSI=${baseline.environment.isGsiSuspected}, SELinux=${baseline.environment.selinuxMode}, Root=${baseline.environment.rootGranted}",
             evidenceSnippet = "boot=${baseline.environment.bootSignature} | vendor=${baseline.environment.vendorFingerprint}",
             status = EvidenceStatus.CONFIRMED,
+            knowledgeLevel = KnowledgeLevel.FACT
+        )
+
+        val changedSysfsCount = sysfsTransitions.count { it.changed }
+        findings += InvestigationFinding(
+            id = "find_finger_chain",
+            title = if (language == AppLanguage.FR) "Chaîne d'exécution au poser du doigt (${fingerDownChain.size} étapes)" else "Finger-Down Execution Chain (${fingerDownChain.size} stages)",
+            detail = "$changedSysfsCount/${sysfsTransitions.size} sysfs nodes transitioned during live session.",
+            evidenceSnippet = fingerDownChain.joinToString("\n") { "[${it.status}] ${it.stage}: ${it.detail}" },
+            status = if (fingerDownChain.any { it.status == EvidenceStatus.FAILED }) EvidenceStatus.FAILED else EvidenceStatus.CONFIRMED,
             knowledgeLevel = KnowledgeLevel.FACT
         )
 

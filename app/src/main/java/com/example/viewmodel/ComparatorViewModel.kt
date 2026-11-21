@@ -23,7 +23,7 @@ private const val TAG = "ComparatorViewModel"
 
 class ComparatorViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val aiAnalyzer = GeminiFodAiAnalyzer()
+    private val aiAnalyzer = GeminiFodAiAnalyzer(application)
     private val sessionRepo = LocalSessionRepository(application)
 
     private val _romReport = MutableStateFlow<FodDiagnosticReport?>(null)
