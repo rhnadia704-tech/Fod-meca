@@ -194,28 +194,35 @@ fun DiagnosticScreen(
                 Button(
                     onClick = { viewModel.startBaselineAndWaitForEnrollment(rootEnabled) },
                     enabled = capturePhase is CapturePhase.Idle || capturePhase is CapturePhase.Error,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                     modifier = Modifier
                         .weight(1f)
                         .heightIn(min = 50.dp)
                         .testTag("btn_analyse")
                 ) {
-                    Icon(Icons.Filled.PlayArrow, contentDescription = strings.btnAnalyse)
-                    Spacer(Modifier.width(6.dp))
-                    Text(strings.btnAnalyse, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Icon(Icons.Filled.PlayArrow, contentDescription = strings.btnAnalyse, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(5.dp))
+                    Text(strings.btnAnalyse, maxLines = 1, softWrap = false)
                 }
 
                 Box(modifier = Modifier.weight(1f)) {
                     OutlinedButton(
                         onClick = { showExportMenu = true },
                         enabled = currentReport != null && !exportState.isExporting,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 50.dp)
                             .testTag("btn_extract_result")
                     ) {
-                        Icon(Icons.Filled.Download, contentDescription = strings.btnExtractResult)
-                        Spacer(Modifier.width(6.dp))
-                        Text(strings.btnExtractResult, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Icon(Icons.Filled.Download, contentDescription = strings.btnExtractResult, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(5.dp))
+                        Text(
+                            text = strings.btnExtractResult,
+                            style = MaterialTheme.typography.labelLarge,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
                     DropdownMenu(
                         expanded = showExportMenu,

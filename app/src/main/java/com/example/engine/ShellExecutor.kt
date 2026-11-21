@@ -27,15 +27,20 @@ object ShellExecutor {
     private val forbiddenTokens = listOf(
         "mount ", "umount ", "rm ", "mv ", "cp ", "chmod ", "chown ",
         "setprop ", "dd of=", "flash", "fastboot", "mkfs", "insmod", "rmmod",
-        " > ", " >> ", "tee ", "echo "
+        "tee "
     )
 
     private fun validateReadOnly(command: String) {
-        val lower = command.lowercase()
+        val sanitized = command.lowercase()
+            .replace("2>/dev/null", "")
+            .replace("2>&1", "")
         for (token in forbiddenTokens) {
-            if (lower.contains(token)) {
+            if (sanitized.contains(token)) {
                 throw SecurityException("Non-intrusive read-only policy blocked command containing '$token'")
             }
+        }
+        if (sanitized.contains(">>") || Regex("(^|[^2&])>").containsMatchIn(sanitized)) {
+            throw SecurityException("Non-intrusive read-only policy blocked output redirection")
         }
     }
 
