@@ -6,6 +6,8 @@ import android.os.Environment
 import com.example.i18n.AppLanguage
 import com.example.model.ComparisonResult
 import com.example.model.FodDiagnosticReport
+import com.example.model.PortAnalysisResult
+import com.example.model.RawZipArchiveBundle
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.Dispatchers
@@ -152,6 +154,33 @@ object StreamingReportExporter {
                     streamComparisonHtml(writer, comparison, rom, gsi, language)
                 } else {
                     streamComparisonMarkdown(writer, comparison, rom, gsi, language)
+                }
+                writer.flush()
+            }
+        }
+        label
+    }
+
+    suspend fun exportPortSingleFile(
+        context: Context,
+        portResult: PortAnalysisResult,
+        romZip: RawZipArchiveBundle,
+        gsiZip: RawZipArchiveBundle,
+        language: AppLanguage,
+        asHtml: Boolean,
+        targetUri: Uri?,
+        directFileName: String? = null
+    ): String = withContext(Dispatchers.IO) {
+        val ext = if (asHtml) "html" else "md"
+        val stamp = portResult.createdAtIso.replace(":", "").replace("-", "").take(15)
+        val defaultName = "fod_port_dossier_$stamp.$ext"
+        val (stream, label) = openTargetOutput(context, targetUri, directFileName ?: defaultName)
+        stream.use { out ->
+            BufferedWriter(OutputStreamWriter(out, Charsets.UTF_8), 64 * 1024).use { writer ->
+                if (asHtml) {
+                    streamPortHtml(writer, portResult, romZip, gsiZip, language)
+                } else {
+                    streamPortMarkdown(writer, portResult, romZip, gsiZip, language)
                 }
                 writer.flush()
             }
@@ -489,6 +518,146 @@ object StreamingReportExporter {
         writeHtmlDetails(w, "RAW Appendix: ROM logcat_enrollment", rom.rawArtifacts.logcatEnrollment)
         writeHtmlDetails(w, "RAW Appendix: GSI logcat_enrollment", gsi.rawArtifacts.logcatEnrollment)
         w.appendLine("</body></html>")
+    }
+
+    internal fun streamPortMarkdown(
+        w: BufferedWriter,
+        p: PortAnalysisResult,
+        romZip: RawZipArchiveBundle,
+        gsiZip: RawZipArchiveBundle,
+        lang: AppLanguage
+    ) {
+        w.appendLine("# FOD DETECTOR — COMPLETE PORTING DOSSIER (CUSTOM ROM vs GSI)")
+        w.appendLine("- **Generated**: `${p.createdAtIso}`")
+        w.appendLine("- **ROM Archive**: `${p.romSourceName}` (${p.romFilesRead} files, ${p.romTotalBytes / 1024} KB)")
+        w.appendLine("- **GSI Archive**: `${p.gsiSourceName}` (${p.gsiFilesRead} files, ${p.gsiTotalBytes / 1024} KB)")
+        w.appendLine("- **Invariant**: Untouched shared `boot` and `vendor` partitions (GSI/system-side porting only).")
+        w.appendLine("- **Boot/Vendor Parity**: `${p.bootVendorParityVerified}` (${p.bootVendorParitySummary})")
+        w.appendLine("- **AI Engine**: `${p.aiProviderUsed.ifBlank { "Deterministic Local Engine" }}`")
+        w.appendLine()
+        w.appendLine("## 1. Factual Root-Cause Verdict")
+        w.appendLine(p.factualRootCauseVerdict)
+        w.appendLine()
+        if (p.aiFactualSynthesis.isNotBlank()) {
+            w.appendLine("## 2. 100% Factual AI & Porting Synthesis")
+            w.appendLine(p.aiFactualSynthesis)
+            w.appendLine()
+        }
+        w.appendLine("## 3. Ranked System-Side Porting Solutions (${p.portingSolutions.size})")
+        p.portingSolutions.forEach { sol ->
+            w.appendLine("### #${sol.rank} — ${sol.title} (${sol.confidencePercent}% confidence)")
+            w.appendLine("- **Layer**: `${sol.layer}` | **Requires SystemUI/Framework**: `${sol.requiresFrameworkOrSystemUi}`")
+            w.appendLine("- **Why**: ${sol.whyItApplies}")
+            if (sol.exactSourcesInZip.isNotEmpty()) {
+                w.appendLine("- **Exact ZIP Evidence**:")
+                sol.exactSourcesInZip.forEach { src -> w.appendLine("  - `$src`") }
+            }
+            w.appendLine("- **Action Steps**:")
+            sol.concreteActionSteps.forEachIndexed { idx, step -> w.appendLine("  ${idx + 1}. $step") }
+            w.appendLine("- **Limitations**: ${sol.limitations}")
+            w.appendLine()
+        }
+        w.appendLine("## 4. Exhaustive Multi-File Factual Diffs (${p.factualDiffs.size})")
+        p.factualDiffs.forEach { d ->
+            w.appendLine("- **[${d.status} | ${d.knowledgeLevel}] (${d.sourceFile}) ${d.category} :: ${d.title}**")
+            w.appendLine("  - ROM: `${d.romEvidence.replace("\n", " | ")}`")
+            w.appendLine("  - GSI: `${d.gsiEvidence.replace("\n", " | ")}`")
+            w.appendLine("  - Impact: ${d.impact}")
+        }
+        w.appendLine()
+        w.appendLine("## 5. Filtered Shared Non-Blocking Noise (${p.filteredSharedNoiseCount} total)")
+        p.sharedNoiseSamples.forEach { n ->
+            w.appendLine("- (${n.sourceFile}) ${n.title}: ${n.impact}")
+        }
+        w.appendLine()
+        w.appendLine("## 6. Complete ZIP Entry Indexes")
+        w.appendLine("### ROM ZIP (${romZip.totalFiles} entries)")
+        romZip.entries.forEach { e ->
+            w.appendLine("- `${e.path}` (${e.sizeBytes} bytes, ${e.lineCount} lines${if (e.truncatedInMemory) ", TRUNCATED" else ""})")
+        }
+        w.appendLine("### GSI ZIP (${gsiZip.totalFiles} entries)")
+        gsiZip.entries.forEach { e ->
+            w.appendLine("- `${e.path}` (${e.sizeBytes} bytes, ${e.lineCount} lines${if (e.truncatedInMemory) ", TRUNCATED" else ""})")
+        }
+        w.appendLine()
+        w.appendLine("## 7. Full Raw ZIP Contents Appendix")
+        romZip.rawFiles.forEach { (path, content) ->
+            if (path == "report.json") return@forEach
+            w.appendLine("### [ROM] $path")
+            w.appendLine("```text")
+            w.appendLine(content)
+            w.appendLine("```")
+        }
+        gsiZip.rawFiles.forEach { (path, content) ->
+            if (path == "report.json") return@forEach
+            w.appendLine("### [GSI] $path")
+            w.appendLine("```text")
+            w.appendLine(content)
+            w.appendLine("```")
+        }
+        w.flush()
+    }
+
+    internal fun streamPortHtml(
+        w: BufferedWriter,
+        p: PortAnalysisResult,
+        romZip: RawZipArchiveBundle,
+        gsiZip: RawZipArchiveBundle,
+        lang: AppLanguage
+    ) {
+        writeHtmlHeader(w, "FOD Porting Dossier — ${p.romSourceName} vs ${p.gsiSourceName}")
+        w.appendLine("<h1>FOD PORTING DOSSIER · CUSTOM ROM vs GSI</h1>")
+        w.appendLine("<div class='card'>")
+        w.appendLine("<p><b>ROM Archive:</b> ${esc(p.romSourceName)} (${p.romFilesRead} files, ${p.romTotalBytes / 1024} KB)</p>")
+        w.appendLine("<p><b>GSI Archive:</b> ${esc(p.gsiSourceName)} (${p.gsiFilesRead} files, ${p.gsiTotalBytes / 1024} KB)</p>")
+        w.appendLine("<p><b>Boot/Vendor Parity:</b> ${p.bootVendorParityVerified} — <code>${esc(p.bootVendorParitySummary)}</code></p>")
+        w.appendLine("<p><b>AI Engine:</b> <span class='badge'>${esc(p.aiProviderUsed.ifBlank { "Local Forensic Engine" })}</span></p>")
+        w.appendLine("<pre>${esc(p.factualRootCauseVerdict)}</pre>")
+        w.appendLine("</div>")
+
+        if (p.aiFactualSynthesis.isNotBlank()) {
+            w.appendLine("<h2>100% Factual AI &amp; Porting Synthesis</h2><pre>${esc(p.aiFactualSynthesis)}</pre>")
+        }
+
+        w.appendLine("<h2>Ranked GSI/System Porting Solutions (${p.portingSolutions.size})</h2>")
+        p.portingSolutions.forEach { sol ->
+            w.appendLine("<div class='card'>")
+            w.appendLine("<h3>#${sol.rank} · ${esc(sol.title)} (${sol.confidencePercent}%)</h3>")
+            w.appendLine("<p><b>Layer:</b> ${esc(sol.layer)} | <b>SystemUI/Framework Edit:</b> ${sol.requiresFrameworkOrSystemUi}</p>")
+            w.appendLine("<p>${esc(sol.whyItApplies)}</p>")
+            w.appendLine("<ul>")
+            sol.concreteActionSteps.forEach { step -> w.appendLine("<li>${esc(step)}</li>") }
+            w.appendLine("</ul>")
+            if (sol.exactSourcesInZip.isNotEmpty()) {
+                w.appendLine("<p><b>Evidence:</b></p><ul>")
+                sol.exactSourcesInZip.forEach { src -> w.appendLine("<li><code>${esc(src)}</code></li>") }
+                w.appendLine("</ul>")
+            }
+            w.appendLine("<p><i>Limits: ${esc(sol.limitations)}</i></p>")
+            w.appendLine("</div>")
+        }
+
+        w.appendLine("<h2>Multi-File Factual Diffs (${p.factualDiffs.size})</h2><ul>")
+        p.factualDiffs.forEach { d ->
+            w.appendLine("<li><b>[${d.status}] (${esc(d.sourceFile)}) ${esc(d.title)}</b><br/>ROM: <code>${esc(d.romEvidence)}</code><br/>GSI: <code>${esc(d.gsiEvidence)}</code><br/><i>${esc(d.impact)}</i></li>")
+        }
+        w.appendLine("</ul>")
+
+        w.appendLine("<h2>Filtered Shared Non-Blocking Noise (${p.filteredSharedNoiseCount})</h2><ul>")
+        p.sharedNoiseSamples.take(60).forEach { n ->
+            w.appendLine("<li>(${esc(n.sourceFile)}) <b>${esc(n.title)}</b>: ${esc(n.impact)}</li>")
+        }
+        w.appendLine("</ul>")
+
+        w.appendLine("<h2>Raw ZIP File Indexes &amp; Artifacts</h2>")
+        romZip.rawFiles.forEach { (path, content) ->
+            if (path != "report.json") writeHtmlDetails(w, "[ROM] $path", content)
+        }
+        gsiZip.rawFiles.forEach { (path, content) ->
+            if (path != "report.json") writeHtmlDetails(w, "[GSI] $path", content)
+        }
+        w.appendLine("</body></html>")
+        w.flush()
     }
 
     private fun writeHtmlHeader(w: BufferedWriter, title: String) {

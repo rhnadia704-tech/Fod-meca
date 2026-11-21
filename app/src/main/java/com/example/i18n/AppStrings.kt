@@ -14,6 +14,7 @@ data class AppStrings(
     val appSubtitle: String,
     val tabDiagnostic: String,
     val tabComparator: String,
+    val tabPort: String,
     val tabSettings: String,
 
     // Diagnostic mode & controls
@@ -97,8 +98,32 @@ data class AppStrings(
     val emptyComparatorTitle: String,
     val emptyComparatorBody: String,
 
-    // Settings
+    // PORT Tab
+    val portTitle: String,
+    val portSubtitleBanner: String,
+    val portImportRomLabel: String,
+    val portImportGsiLabel: String,
+    val portBtnAnalyze: String,
+    val portReadingZips: String,
+    val portRunningDeepAi: String,
+    val portSubTabVerdict: String,
+    val portSubTabSolutions: String,
+    val portSubTabFileDiffs: String,
+    val portSearchDiffsHint: String,
+    val portSharedNoiseFiltered: String,
+    val portEmptyTitle: String,
+    val portEmptyBody: String,
+    val portExportReportLabel: String,
+
+    // Settings & AI Key
     val settingsTitle: String,
+    val settingsAiTitle: String,
+    val settingsAiDesc: String,
+    val settingsAiKeyLabel: String,
+    val settingsAiKeyPlaceholder: String,
+    val btnSaveAiKey: String,
+    val btnClearAiKey: String,
+    val btnTestAiConnection: String,
     val settingsLanguageTitle: String,
     val settingsLanguageDesc: String,
     val settingsThemeTitle: String,
@@ -131,6 +156,7 @@ val FrenchStrings = AppStrings(
     appSubtitle = "Rétro-ingénierie & Forensique Fingerprint On Display",
     tabDiagnostic = "DIAGNOSTIC",
     tabComparator = "COMPARATEUR",
+    tabPort = "PORT",
     tabSettings = "PARAMÈTRES",
 
     selectModeTitle = "Mode d'investigation",
@@ -180,7 +206,7 @@ val FrenchStrings = AppStrings(
     blockingBreakTag = "RUPTURE BLOQUANTE",
     firstBreakTitle = "Première rupture démontrable",
     successDespiteNoiseTitle = "Comportement réel malgré les erreurs de log",
-    aiSynthesisTitle = "Synthèse Rétro-Ingénierie (Gemini 4 Carbon · High Thinking)",
+    aiSynthesisTitle = "Synthèse Rétro-Ingénierie (Gemini · High Thinking)",
     aiThinkingBadge = "THINKING HIGH",
     emptyDiagnosticTitle = "Prêt pour l'investigation FOD",
     emptyDiagnosticBody = "Choisissez ROM FOD ou GSI FOD puis appuyez sur ANALYSE pour inspecter l'architecture réelle et tracer un enregistrement d'empreinte.",
@@ -208,7 +234,30 @@ val FrenchStrings = AppStrings(
     emptyComparatorTitle = "Importez les deux archives ZIP",
     emptyComparatorBody = "Chargez le ZIP de référence CUSTOM ROM et le ZIP cible GSI pour identifier la cause réelle de la rupture FOD.",
 
+    portTitle = "PORTAGE FOD · ANALYSE INTÉGRALE DES ZIP",
+    portSubtitleBanner = "Lit 100 % de tous les fichiers contenus dans les deux ZIP (getprop complet, dumpsys, RRO, lshal, VINTF, sysfs, init.rc, ELF, logcat, dmesg). Analyse IA 100 % factuelle pour trouver la meilleure solution de portage côté GSI/système (boot & vendor intacts).",
+    portImportRomLabel = "ZIP Custom ROM (FOD OK)",
+    portImportGsiLabel = "ZIP GSI (FOD KO)",
+    portBtnAnalyze = "Analyser tout le contenu des ZIP",
+    portReadingZips = "Lecture intégrale de toutes les entrées ZIP...",
+    portRunningDeepAi = "Analyse IA 100 % factuelle & plan de portage en cours...",
+    portSubTabVerdict = "VERDICT & IA FACTUELLE",
+    portSubTabSolutions = "SOLUTIONS DE PORTAGE",
+    portSubTabFileDiffs = "DIFF INTÉGRAL ZIP",
+    portSearchDiffsHint = "Rechercher dans tous les fichiers différés (getprop, overlay, dumpsys, elf...)",
+    portSharedNoiseFiltered = "éléments identiques/absents sur les deux ZIP filtrés comme non bloquants",
+    portEmptyTitle = "Prêt pour l'analyse de portage intégrale",
+    portEmptyBody = "Importez les deux archives ZIP (Custom ROM fonctionnelle + GSI) pour lire chaque fichier brut, identifier la cause exacte du blocage et générer la meilleure solution de portage.",
+    portExportReportLabel = "Exporter Dossier Portage",
+
     settingsTitle = "PARAMÈTRES & AUTORISATIONS",
+    settingsAiTitle = "Moteur IA Gemini & Repli Universel",
+    settingsAiDesc = "Utilise Firebase AI Logic si configuré, ou votre clé API Gemini personnelle (stockée uniquement sur cet appareil) pour fonctionner même sur les APK compilés via GitHub Actions sans google-services.json.",
+    settingsAiKeyLabel = "Clé API Gemini personnelle (optionnelle)",
+    settingsAiKeyPlaceholder = "AIza...",
+    btnSaveAiKey = "Enregistrer",
+    btnClearAiKey = "Effacer",
+    btnTestAiConnection = "Tester l'IA",
     settingsLanguageTitle = "Langue de l'interface et des rapports",
     settingsLanguageDesc = "Bascule instantanément entre Français et Anglais.",
     settingsThemeTitle = "Thème d'affichage",
@@ -233,7 +282,7 @@ val FrenchStrings = AppStrings(
     sysfsTransitionsTitle = "Transitions sysfs FOD/HBM/Touch (Avant → Pendant → Après)",
     compTrueGsiBlockers = "Vrais Bloqueurs GSI",
     compSharedNonBlockers = "Bruit partagé (Absent/KO sur les 2)",
-    aiLocalFallbackNotice = "Build CI sans google-services.json : Firebase AI non initialisé sur cet APK (ajoutez le secret GitHub GOOGLE_SERVICES_JSON pour activer Gemini 4 Carbon). Synthèse forensique locale générée ci-dessous :"
+    aiLocalFallbackNotice = "IA Cloud indisponible (aucun google-services.json actif et aucune clé API Gemini personnelle configurée dans Paramètres). Synthèse forensique locale générée ci-dessous :"
 )
 
 val EnglishStrings = AppStrings(
@@ -241,6 +290,7 @@ val EnglishStrings = AppStrings(
     appSubtitle = "Fingerprint On Display Reverse Engineering & Forensics",
     tabDiagnostic = "DIAGNOSTIC",
     tabComparator = "COMPARATOR",
+    tabPort = "PORT",
     tabSettings = "SETTINGS",
 
     selectModeTitle = "Investigation Mode",
@@ -290,7 +340,7 @@ val EnglishStrings = AppStrings(
     blockingBreakTag = "BLOCKING BREAK",
     firstBreakTitle = "First Demonstrable Break",
     successDespiteNoiseTitle = "Real Enrollment Outcome Despite Log Warnings",
-    aiSynthesisTitle = "Reverse Engineering Synthesis (Gemini 4 Carbon · High Thinking)",
+    aiSynthesisTitle = "Reverse Engineering Synthesis (Gemini · High Thinking)",
     aiThinkingBadge = "THINKING HIGH",
     emptyDiagnosticTitle = "Ready for FOD Investigation",
     emptyDiagnosticBody = "Select ROM FOD or GSI FOD and tap ANALYSE to discover the real architecture and trace a live fingerprint enrollment.",
@@ -318,7 +368,30 @@ val EnglishStrings = AppStrings(
     emptyComparatorTitle = "Import Both ZIP Archives",
     emptyComparatorBody = "Load the working CUSTOM ROM reference ZIP and the target GSI ZIP to pinpoint the exact root cause of FOD failure.",
 
+    portTitle = "FOD PORTING · FULL ZIP ANALYSIS",
+    portSubtitleBanner = "Reads 100% of all files inside both ZIPs (full getprop, dumpsys, RRO, lshal, VINTF, sysfs, init.rc, ELF, logcat, dmesg). 100% factual AI synthesis to determine why GSI FOD breaks and the best system/GSI porting path (boot & vendor untouched).",
+    portImportRomLabel = "Custom ROM ZIP (Working FOD)",
+    portImportGsiLabel = "GSI ZIP (Broken FOD)",
+    portBtnAnalyze = "Analyze Complete ZIP Contents",
+    portReadingZips = "Reading all ZIP entries exhaustively...",
+    portRunningDeepAi = "Running 100% factual AI & porting blueprint...",
+    portSubTabVerdict = "VERDICT & FACTUAL AI",
+    portSubTabSolutions = "PORTING SOLUTIONS",
+    portSubTabFileDiffs = "FULL ZIP DIFFS",
+    portSearchDiffsHint = "Search across all file diffs (getprop, overlay, dumpsys, elf...)",
+    portSharedNoiseFiltered = "shared identical/missing items across both ZIPs filtered as non-blocking",
+    portEmptyTitle = "Ready for Full-Archive Port Analysis",
+    portEmptyBody = "Import both diagnostic ZIPs (working Custom ROM + target GSI) to read every raw artifact, identify exact root cause, and rank the best system-side porting solution.",
+    portExportReportLabel = "Export Porting Dossier",
+
     settingsTitle = "SETTINGS & PERMISSIONS",
+    settingsAiTitle = "Gemini AI Engine & Universal Fallback",
+    settingsAiDesc = "Uses Firebase AI Logic when configured, or your optional personal Gemini API key (stored locally on device) so AI works even in GitHub Actions builds without google-services.json.",
+    settingsAiKeyLabel = "Personal Gemini API Key (optional)",
+    settingsAiKeyPlaceholder = "AIza...",
+    btnSaveAiKey = "Save",
+    btnClearAiKey = "Clear",
+    btnTestAiConnection = "Test AI",
     settingsLanguageTitle = "Interface & Report Language",
     settingsLanguageDesc = "Switches immediately between French and English.",
     settingsThemeTitle = "Display Theme",
@@ -343,7 +416,7 @@ val EnglishStrings = AppStrings(
     sysfsTransitionsTitle = "FOD/HBM/Touch Sysfs Transitions (Before → During → After)",
     compTrueGsiBlockers = "True GSI Blockers",
     compSharedNonBlockers = "Shared Noise (Missing/KO on Both)",
-    aiLocalFallbackNotice = "CI build without google-services.json: Firebase AI is not initialized in this APK (add GitHub Secret GOOGLE_SERVICES_JSON to enable Gemini 4 Carbon). Local forensic synthesis generated below:"
+    aiLocalFallbackNotice = "Cloud AI unavailable (no active google-services.json and no personal Gemini API key set in Settings). Local forensic synthesis generated below:"
 )
 
 val LocalAppStrings = staticCompositionLocalOf { FrenchStrings }

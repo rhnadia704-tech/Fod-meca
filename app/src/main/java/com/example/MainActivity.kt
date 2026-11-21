@@ -11,10 +11,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CompareArrows
+import androidx.compose.material.icons.automirrored.filled.CompareArrows
+import androidx.compose.material.icons.automirrored.outlined.CompareArrows
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.outlined.CompareArrows
+import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Fingerprint
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Icon
@@ -30,6 +32,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -42,14 +45,17 @@ import com.example.i18n.LocalAppStrings
 import com.example.i18n.stringsFor
 import com.example.ui.screens.ComparatorScreen
 import com.example.ui.screens.DiagnosticScreen
+import com.example.ui.screens.PortScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.theme.FodDetectorTheme
 import com.example.viewmodel.ComparatorViewModel
 import com.example.viewmodel.DiagnosticViewModel
+import com.example.viewmodel.PortViewModel
 import com.example.viewmodel.SettingsViewModel
 
 private const val ROUTE_DIAGNOSTIC = "diagnostic"
 private const val ROUTE_COMPARATOR = "comparator"
+private const val ROUTE_PORT = "port"
 private const val ROUTE_SETTINGS = "settings"
 
 class MainActivity : ComponentActivity() {
@@ -80,6 +86,7 @@ private data class NavTab(
 fun FodDetectorApp(
     diagnosticVm: DiagnosticViewModel = viewModel(),
     comparatorVm: ComparatorViewModel = viewModel(),
+    portVm: PortViewModel = viewModel(),
     settingsVm: SettingsViewModel = viewModel()
 ) {
     val userSettings by settingsVm.settings.collectAsStateWithLifecycle()
@@ -102,9 +109,16 @@ fun FodDetectorApp(
             NavTab(
                 route = ROUTE_COMPARATOR,
                 label = strings.tabComparator,
-                selectedIcon = Icons.Filled.CompareArrows,
-                unselectedIcon = Icons.Outlined.CompareArrows,
+                selectedIcon = Icons.AutoMirrored.Filled.CompareArrows,
+                unselectedIcon = Icons.AutoMirrored.Outlined.CompareArrows,
                 testTag = "nav_comparator"
+            ),
+            NavTab(
+                route = ROUTE_PORT,
+                label = strings.tabPort,
+                selectedIcon = Icons.Filled.Build,
+                unselectedIcon = Icons.Outlined.Build,
+                testTag = "nav_port"
             ),
             NavTab(
                 route = ROUTE_SETTINGS,
@@ -145,7 +159,14 @@ fun FodDetectorApp(
                                             contentDescription = tab.label
                                         )
                                     },
-                                    label = { Text(tab.label) },
+                                    label = {
+                                        Text(
+                                            text = tab.label,
+                                            maxLines = 1,
+                                            softWrap = false,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    },
                                     modifier = Modifier.testTag(tab.testTag)
                                 )
                             }
@@ -171,7 +192,14 @@ fun FodDetectorApp(
                                             contentDescription = tab.label
                                         )
                                     },
-                                    label = { Text(tab.label) },
+                                    label = {
+                                        Text(
+                                            text = tab.label,
+                                            maxLines = 1,
+                                            softWrap = false,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    },
                                     modifier = Modifier.testTag(tab.testTag)
                                 )
                             }
@@ -194,6 +222,13 @@ fun FodDetectorApp(
                         composable(ROUTE_COMPARATOR) {
                             ComparatorScreen(
                                 viewModel = comparatorVm,
+                                allFilesGranted = allFilesGranted,
+                                language = userSettings.language
+                            )
+                        }
+                        composable(ROUTE_PORT) {
+                            PortScreen(
+                                viewModel = portVm,
                                 allFilesGranted = allFilesGranted,
                                 language = userSettings.language
                             )

@@ -4,6 +4,8 @@ import com.example.engine.BaselineProbeResult
 import com.example.engine.ElfDisassembler
 import com.example.engine.FodComparatorEngine
 import com.example.engine.PatchAndArchitectureAnalyzer
+import com.example.engine.PortAnalysisEngine
+import com.example.engine.PortZipDeepReader
 import com.example.engine.ShellExecutor
 import com.example.i18n.AppLanguage
 import com.example.model.ComponentCategory
@@ -20,6 +22,8 @@ import com.example.model.RawArtifactsBundle
 import com.example.model.SessionEvent
 import com.example.model.SysfsTransition
 import com.example.storage.StreamingReportExporter
+import java.io.BufferedWriter
+import java.io.StringWriter
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -299,5 +303,88 @@ class FodEngineUnitTest {
             }
             assertTrue("Command should have been blocked: $cmd", didThrow)
         }
+    }
+
+    @Test
+    fun bootParity_handlesOmittedVbmetaDigestGracefully() {
+        val romBoot = "fcd0aa8857711b79a04bad47821087912ae83740aa565be3217aefd9f776c38d | 4.14.357-openela-perf-g9678313c01ba"
+        val gsiBoot = "4.14.357-openela-perf-g9678313c01ba"
+        assertTrue(FodComparatorEngine.areBootSignaturesCompatible(romBoot, gsiBoot))
+        assertFalse(
+            FodComparatorEngine.areBootSignaturesCompatible(
+                "4.14.357-openela-perf-aaa",
+                "5.10.100-gki-bbb"
+            )
+        )
+    }
+
+    @Test
+    fun portZipAndEngine_readsAllEntriesAndFiltersInactiveOrSharedNoise() {
+        fun buildZipBytes(files: Map<String, String>): ByteArray {
+            val baos = ByteArrayOutputStream()
+            ZipOutputStream(baos).use { z ->
+                files.forEach { (name, content) ->
+                    z.putNextEntry(ZipEntry(name))
+                    z.write(content.toByteArray(Charsets.UTF_8))
+                    z.closeEntry()
+                }
+            }
+            return baos.toByteArray()
+        }
+
+        val romBytes = buildZipBytes(
+            mapOf(
+                "metadata/environment.txt" to "Boot Signature: fcd0aa | 4.14.357-openela-perf\nVendor Fingerprint: google/mustang_beta/release-keys",
+                "raw/getprop_all.txt" to "[ro.hardware.fp.fod]: [true]\n[ro.build.date.utc]: [1700000001]\n",
+                "raw/dumpsys_overlay.txt" to "[x] com.xiaomi.udfps.overlay\n[ ] com.android.systemui.overlay.ambientcue\n",
+                "raw/selinux_denials.txt" to "avc: denied { read } for scontext=u:r:system_server:s0 tclass=file\n",
+                "raw/lshal.txt" to "android.hardware.biometrics.fingerprint@2.3::IBiometricsFingerprint/default\n",
+                "raw/logcat_enrollment.txt" to "onFingerDown id=0\nextCmd cmd=10\nonEnrollResult remaining=14\n"
+            )
+        )
+        val gsiBytes = buildZipBytes(
+            mapOf(
+                "metadata/environment.txt" to "Boot Signature: 4.14.357-openela-perf\nVendor Fingerprint: google/mustang_beta/release-keys",
+                "raw/getprop_all.txt" to "[persist.sys.phh.fod.xiaomi]: [true]\n[ro.build.date.utc]: [1700009999]\n",
+                "raw/dumpsys_overlay.txt" to "[x] org.treble.generic\n",
+                "raw/selinux_denials.txt" to "avc: denied { read } for scontext=u:r:system_server:s0 tclass=file\navc: denied { call } for scontext=u:r:system_app:s0 tclass=binder\n",
+                "raw/lshal.txt" to "android.hardware.biometrics.fingerprint@2.3::IBiometricsFingerprint/default\n",
+                "raw/logcat_enrollment.txt" to "UdfpsController: showUdfpsOverlay illumination active\n"
+            )
+        )
+
+        val romBundle = PortZipDeepReader.readCompleteZipStream(ByteArrayInputStream(romBytes), "ROM", "rom.zip")
+        val gsiBundle = PortZipDeepReader.readCompleteZipStream(ByteArrayInputStream(gsiBytes), "GSI", "gsi.zip")
+        assertEquals(6, romBundle.totalFiles)
+        assertEquals(6, gsiBundle.totalFiles)
+
+        val portResult = PortAnalysisEngine.analyze(romBundle, gsiBundle, AppLanguage.FR)
+        assertTrue(portResult.bootVendorParityVerified)
+        // Missing FOD property & active RRO overlay & GSI-only AVC denial & missing ROM callbacks detected
+        assertTrue(portResult.factualDiffs.any { it.title == "ro.hardware.fp.fod" && it.status == EvidenceStatus.FAILED })
+        assertTrue(portResult.factualDiffs.any { it.title == "com.xiaomi.udfps.overlay" && it.status == EvidenceStatus.FAILED })
+        assertTrue(portResult.factualDiffs.any { it.category == "SELINUX AVC (GSI-ONLY)" })
+        assertTrue(portResult.factualDiffs.any { it.category == "LIVE LOGCAT CALLBACKS" })
+        // Inactive ROM overlay & shared AVC denial must NOT appear in factualDiffs, only in sharedNoise
+        assertFalse(portResult.factualDiffs.any { it.title == "com.android.systemui.overlay.ambientcue" })
+        assertTrue(portResult.sharedNoiseSamples.any { it.title == "com.android.systemui.overlay.ambientcue" })
+        assertTrue(portResult.filteredSharedNoiseCount >= 2)
+        // Porting solutions ranked cleanly
+        assertTrue(portResult.portingSolutions.size >= 3)
+
+        // Single-file MD & HTML exporters include complete sections
+        val mdOut = StringWriter()
+        BufferedWriter(mdOut).use { bw ->
+            StreamingReportExporter.streamPortMarkdown(bw, portResult, romBundle, gsiBundle, AppLanguage.FR)
+        }
+        val mdStr = mdOut.toString()
+        assertTrue(mdStr.contains("com.xiaomi.udfps.overlay"))
+        assertTrue(mdStr.contains("[ROM] raw/logcat_enrollment.txt"))
+
+        val htmlOut = StringWriter()
+        BufferedWriter(htmlOut).use { bw ->
+            StreamingReportExporter.streamPortHtml(bw, portResult, romBundle, gsiBundle, AppLanguage.FR)
+        }
+        assertTrue(htmlOut.toString().contains("FOD PORTING DOSSIER"))
     }
 }

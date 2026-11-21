@@ -19,9 +19,10 @@ object FodComparatorEngine {
         gsi: FodDiagnosticReport,
         language: AppLanguage
     ): ComparisonResult {
-        val bootMatch = rom.environment.bootSignature == gsi.environment.bootSignature ||
-            rom.environment.bootSignature.startsWith("UNKNOWN") ||
-            gsi.environment.bootSignature.startsWith("UNKNOWN")
+        val bootMatch = areBootSignaturesCompatible(
+            rom.environment.bootSignature,
+            gsi.environment.bootSignature
+        )
         val vendorMatch = rom.environment.vendorFingerprint == gsi.environment.vendorFingerprint ||
             rom.environment.vendorFingerprint == "UNKNOWN" ||
             gsi.environment.vendorFingerprint == "UNKNOWN"
@@ -529,5 +530,14 @@ object FodComparatorEngine {
         }
 
         return list
+    }
+
+    internal fun areBootSignaturesCompatible(romBoot: String, gsiBoot: String): Boolean {
+        if (romBoot == gsiBoot || romBoot.startsWith("UNKNOWN") || gsiBoot.startsWith("UNKNOWN")) {
+            return true
+        }
+        val rTokens = romBoot.split("|").map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("UNKNOWN") }.toSet()
+        val gTokens = gsiBoot.split("|").map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("UNKNOWN") }.toSet()
+        return rTokens.isNotEmpty() && gTokens.isNotEmpty() && rTokens.intersect(gTokens).isNotEmpty()
     }
 }
