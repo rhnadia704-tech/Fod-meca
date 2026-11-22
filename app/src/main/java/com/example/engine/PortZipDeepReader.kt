@@ -116,6 +116,7 @@ object PortZipDeepReader {
             "raw/file_provenance_index.txt" to report.rawArtifacts.fileProvenanceIndex,
             "raw/proc_live_maps.txt" to report.rawArtifacts.procLiveMaps,
             "raw/dex_source_extract.txt" to report.rawArtifacts.dexSourceExtract,
+            "raw/binder_trace_delta.txt" to report.rawArtifacts.binderTraceDelta,
             "disassembly/elf_disassembly_full.txt" to report.rawArtifacts.elfDisassemblyFull
         ).filterValues { it.isNotBlank() }
 

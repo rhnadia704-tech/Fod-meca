@@ -1,9 +1,12 @@
 package com.example.engine
 
 import com.example.i18n.AppLanguage
+import com.example.model.BinderTraceRecord
+import com.example.model.CausalChainLink
 import com.example.model.ComponentCategory
 import com.example.model.DependencyEdge
 import com.example.model.DetectedPatch
+import com.example.model.DexSourceExtract
 import com.example.model.DiagnosticMode
 import com.example.model.DiagnosticSummary
 import com.example.model.DiscoveredComponent
@@ -14,6 +17,7 @@ import com.example.model.FodDiagnosticReport
 import com.example.model.InvestigationFinding
 import com.example.model.KnowledgeLevel
 import com.example.model.LiveProcessMapRecord
+import com.example.model.OverlayDeepInspection
 import com.example.model.RawArtifactsBundle
 import com.example.model.SessionEvent
 import com.example.model.SysfsTransition
@@ -45,7 +49,9 @@ object PatchAndArchitectureAnalyzer {
         surfaceFlingerLiveDelta: String = "",
         sysfsTransitions: List<SysfsTransition> = emptyList(),
         procLiveMaps: List<LiveProcessMapRecord> = baseline.procLiveMaps,
-        procLiveMapsText: String = baseline.procLiveMapsText
+        procLiveMapsText: String = baseline.procLiveMapsText,
+        binderTraces: List<BinderTraceRecord> = baseline.binderTraces,
+        binderTraceDeltaText: String = baseline.binderTraceText
     ): FodDiagnosticReport {
         val components = mutableListOf<DiscoveredComponent>()
         val edges = mutableListOf<DependencyEdge>()
@@ -302,6 +308,26 @@ object PatchAndArchitectureAnalyzer {
             }
         }
 
+        val causalChain = buildCausalChainFromModel(
+            rootGranted = baseline.environment.rootGranted,
+            overlayInspections = baseline.overlayInspections,
+            dexExtracts = baseline.dexSourceExtracts,
+            binderTraces = binderTraces,
+            procLiveMaps = procLiveMaps,
+            elfAnalyses = elfAnalyses,
+            sysfsTransitions = sysfsTransitions,
+            fingerDownChain = finalChain,
+            dumpsysFingerprint = baseline.dumpsysFingerprint,
+            dumpsysBiometric = baseline.dumpsysBiometric,
+            dumpsysSurfaceFlinger = baseline.dumpsysSurfaceFlinger,
+            surfaceFlingerLiveDelta = surfaceFlingerLiveDelta,
+            dmesgDelta = dmesgDelta,
+            lshalOutput = baseline.lshalOutput,
+            serviceList = baseline.serviceList,
+            silentHalStall = silentHalStall,
+            language = language
+        )
+
         val nowIso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).format(Date())
 
         return FodDiagnosticReport(
@@ -353,15 +379,308 @@ object PatchAndArchitectureAnalyzer {
                 overlayDeepInspect = baseline.overlayDeepInspect,
                 fileProvenanceIndex = baseline.fileProvenanceIndex,
                 procLiveMaps = procLiveMapsText,
-                dexSourceExtract = baseline.dexSourceExtractText
+                dexSourceExtract = baseline.dexSourceExtractText,
+                binderTraceDelta = binderTraceDeltaText
             ),
             fingerDownChain = finalChain,
             sysfsTransitions = sysfsTransitions,
             overlayInspections = baseline.overlayInspections,
             fileProvenance = baseline.fileProvenance,
             procLiveMaps = procLiveMaps,
-            dexSourceExtracts = baseline.dexSourceExtracts
+            dexSourceExtracts = baseline.dexSourceExtracts,
+            causalChain = causalChain,
+            binderTraces = binderTraces,
+            filteredNonFodOverlayCount = baseline.filteredNonFodOverlayCount
         )
+    }
+
+    internal fun buildCausalChainFromModel(
+        rootGranted: Boolean,
+        overlayInspections: List<OverlayDeepInspection>,
+        dexExtracts: List<DexSourceExtract>,
+        binderTraces: List<BinderTraceRecord>,
+        procLiveMaps: List<LiveProcessMapRecord>,
+        elfAnalyses: List<ElfBinaryAnalysis>,
+        sysfsTransitions: List<SysfsTransition>,
+        fingerDownChain: List<FingerDownStep>,
+        dumpsysFingerprint: String,
+        dumpsysBiometric: String,
+        dumpsysSurfaceFlinger: String,
+        surfaceFlingerLiveDelta: String,
+        dmesgDelta: String,
+        lshalOutput: String,
+        serviceList: String,
+        silentHalStall: Boolean,
+        language: AppLanguage
+    ): List<CausalChainLink> {
+        val isFr = language == AppLanguage.FR
+        val strictOverlays = overlayInspections.filter { it.isStrictProvenFod || it.bytecodeMatchedResourceKeys.isNotEmpty() || it.lookupWinners.isNotEmpty() }
+            .ifEmpty { overlayInspections }
+
+        // 1. RRO_OVERLAY
+        val topOverlay = strictOverlays.sortedByDescending {
+            (if (it.isEnabled) 1000 else 0) + (it.bytecodeMatchedResourceKeys.size * 50) + (it.lookupWinners.size * 40) + it.fodRelevanceScore
+        }.firstOrNull()
+        val link1Status = when {
+            strictOverlays.any { it.isEnabled && (it.isStrictProvenFod || it.bytecodeMatchedResourceKeys.isNotEmpty() || it.lookupWinners.isNotEmpty()) } -> EvidenceStatus.CONFIRMED
+            strictOverlays.isNotEmpty() -> EvidenceStatus.SUSPECT
+            else -> EvidenceStatus.UNKNOWN
+        }
+        val link1Keys = strictOverlays.flatMap { it.bytecodeMatchedResourceKeys + it.lookupWinners }.distinct().take(12)
+        val link1Code = strictOverlays.take(3).joinToString("\n---\n") { ov ->
+            buildString {
+                appendLine("PKG: ${ov.packageName} (target=${ov.targetPackage}, enabled=${ov.isEnabled}, prio=${ov.priority})")
+                if (ov.bytecodeMatchedResourceKeys.isNotEmpty()) appendLine("BYTECODE_KEYS: ${ov.bytecodeMatchedResourceKeys.joinToString(", ")}")
+                if (ov.lookupWinners.isNotEmpty()) appendLine("LOOKUP: ${ov.lookupWinners.take(3).joinToString(" | ")}")
+                ov.decodedArscEntries.take(6).forEach { appendLine(it) }
+            }.trim()
+        }
+        val link1 = CausalChainLink(
+            order = 1,
+            layer = "RRO_OVERLAY",
+            title = if (isFr) "1. Overlays RRO FOD Prouvés (Zéro faux positif)" else "1. Proven FOD RRO Overlays (Zero False Positives)",
+            componentName = if (strictOverlays.isEmpty()) (if (isFr) "Aucun RRO FOD prouvé" else "No proven FOD RRO")
+            else strictOverlays.take(3).joinToString(", ") { it.packageName },
+            sourceFile = topOverlay?.apkPath ?: "cmd overlay lookup",
+            sourceDirectory = topOverlay?.directory ?: "/product/overlay",
+            status = link1Status,
+            proofKind = when {
+                strictOverlays.any { it.bytecodeMatchedResourceKeys.isNotEmpty() && it.lookupWinners.isNotEmpty() } -> "BYTECODE_RES_ID+LOOKUP_WINNER"
+                strictOverlays.any { it.bytecodeMatchedResourceKeys.isNotEmpty() } -> "BYTECODE_RES_ID"
+                strictOverlays.any { it.lookupWinners.isNotEmpty() } -> "LOOKUP_WINNER"
+                strictOverlays.isNotEmpty() -> "ARSC_DECODED"
+                else -> "MISSING_OR_UNPROVEN"
+            },
+            referencedResourceKeys = link1Keys,
+            codeExcerpt = link1Code,
+            liveRuntimeEvidence = strictOverlays.filter { it.provenInLiveMaps }.joinToString(" | ") { "${it.packageName} mapped in /proc" },
+            breakExplanation = when (link1Status) {
+                EvidenceStatus.UNKNOWN -> if (isFr) "Aucun overlay RRO actif ne surcharge de clé FOD/UDFPS référencée en bytecode." else "No active RRO overrides any bytecode-referenced FOD/UDFPS key."
+                EvidenceStatus.SUSPECT -> if (isFr) "Overlay(s) RRO FOD présents mais désactivés ou non gagnants dans cmd overlay lookup." else "FOD RRO overlay(s) present but disabled or losing lookup."
+                else -> ""
+            }
+        )
+
+        // 2. SYSTEMUI_DEX
+        val sysUiDex = dexExtracts.filter {
+            it.archivePath.contains("SystemUI", true) || it.targetHint.contains("systemui", true)
+        }
+        val sysUiTraces = sysUiDex.flatMap { it.methodTraces }.take(8)
+        val sysUiProc = procLiveMaps.firstOrNull { it.processName.contains("systemui", true) }
+        val step2Live = fingerDownChain.firstOrNull { it.order == 2 }
+        val link2Status = when {
+            step2Live?.status == EvidenceStatus.FAILED -> EvidenceStatus.FAILED
+            sysUiTraces.isNotEmpty() || sysUiDex.any { it.matchedClasses.isNotEmpty() } -> EvidenceStatus.CONFIRMED
+            step2Live?.status == EvidenceStatus.CONFIRMED || step2Live?.status == EvidenceStatus.OBSERVED -> EvidenceStatus.OBSERVED
+            else -> EvidenceStatus.UNKNOWN
+        }
+        val link2Code = buildString {
+            sysUiTraces.take(6).forEach { tr ->
+                appendLine(tr.fqMethod)
+                if (tr.resolvedResKeys.isNotEmpty()) appendLine("  res: ${tr.resolvedResKeys.joinToString(", ")}")
+                if (tr.invokedMethods.isNotEmpty()) appendLine("  calls: ${tr.invokedMethods.take(5).joinToString(" -> ")}")
+                if (tr.bytecodeSnippet.isNotBlank()) appendLine("  code: ${tr.bytecodeSnippet}")
+            }
+            if (isEmpty()) {
+                sysUiDex.forEach { if (it.sourcePseudoSummary.isNotBlank()) appendLine(it.sourcePseudoSummary.take(800)) }
+            }
+        }.trim()
+        val link2 = CausalChainLink(
+            order = 2,
+            layer = "SYSTEMUI_DEX",
+            title = if (isFr) "2. SystemUI Bytecode DEX & Appels UDFPS" else "2. SystemUI DEX Bytecode & UDFPS Calls",
+            componentName = sysUiDex.firstOrNull()?.matchedClasses?.take(3)?.joinToString(", ")
+                ?: "UdfpsController / UdfpsView",
+            sourceFile = sysUiDex.firstOrNull()?.archivePath ?: "/system_ext/priv-app/SystemUI/SystemUI.apk",
+            sourceDirectory = sysUiDex.firstOrNull()?.archivePath?.substringBeforeLast('/', "/system_ext/priv-app/SystemUI") ?: "/system_ext/priv-app/SystemUI",
+            status = link2Status,
+            proofKind = if (sysUiTraces.isNotEmpty()) "DALVIK_BYTECODE_TRACE (${sysUiDex.firstOrNull()?.containerType ?: "DEX"})" else "DEX_CLASS_EXTRACT",
+            referencedResourceKeys = sysUiDex.flatMap { it.resolvedResourceKeys }.distinct().take(12),
+            codeExcerpt = link2Code,
+            liveRuntimeEvidence = listOfNotNull(
+                step2Live?.detail?.takeIf { it.isNotBlank() },
+                sysUiProc?.let { "PID=${it.pid} threads=${it.activeThreads.take(6).joinToString(",")}" }
+            ).joinToString("\n"),
+            breakExplanation = if (link2Status == EvidenceStatus.UNKNOWN) {
+                if (isFr) "Bytecode SystemUI FOD/UDFPS non décodé (archive protégée ou sans symbole UDFPS)." else "SystemUI FOD/UDFPS bytecode not decoded."
+            } else ""
+        )
+
+        // 3. FRAMEWORK_SERVICES_DEX
+        val fwDex = dexExtracts.filter {
+            !it.archivePath.contains("SystemUI", true) && !it.targetHint.contains("systemui", true)
+        }
+        val fwTraces = fwDex.flatMap { it.methodTraces }.take(8)
+        val step1Live = fingerDownChain.firstOrNull { it.order == 1 }
+        val fpSensorMatch = Regex("(sensor|udfps|fod|strength|biometric).*", RegexOption.IGNORE_CASE)
+            .findAll(dumpsysFingerprint + "\n" + dumpsysBiometric)
+            .map { it.value.trim() }.distinct().take(6).joinToString("\n")
+        val link3Status = when {
+            step1Live?.status == EvidenceStatus.FAILED -> EvidenceStatus.FAILED
+            fwTraces.isNotEmpty() || fwDex.any { it.matchedClasses.isNotEmpty() } -> EvidenceStatus.CONFIRMED
+            fpSensorMatch.isNotBlank() || step1Live?.status == EvidenceStatus.CONFIRMED -> EvidenceStatus.OBSERVED
+            else -> EvidenceStatus.UNKNOWN
+        }
+        val link3 = CausalChainLink(
+            order = 3,
+            layer = "FRAMEWORK_SERVICES_DEX",
+            title = if (isFr) "3. Framework / services.jar & BiometricService" else "3. Framework / services.jar & BiometricService",
+            componentName = fwDex.firstOrNull()?.matchedClasses?.take(3)?.joinToString(", ")
+                ?: "FingerprintService / AuthService",
+            sourceFile = fwDex.firstOrNull()?.archivePath ?: "/system/framework/services.jar",
+            sourceDirectory = fwDex.firstOrNull()?.archivePath?.substringBeforeLast('/', "/system/framework") ?: "/system/framework",
+            status = link3Status,
+            proofKind = if (fwTraces.isNotEmpty()) "DALVIK_BYTECODE_TRACE (${fwDex.firstOrNull()?.containerType ?: "DEX"})" else "DUMPSYS_BIOMETRIC",
+            referencedResourceKeys = fwDex.flatMap { it.resolvedResourceKeys }.distinct().take(12),
+            codeExcerpt = fwTraces.take(6).joinToString("\n") { tr ->
+                "${tr.fqMethod} -> [${tr.invokedMethods.take(4).joinToString(", ")}]"
+            }.ifBlank { fwDex.firstOrNull()?.sourcePseudoSummary?.take(700).orEmpty() },
+            liveRuntimeEvidence = listOfNotNull(
+                step1Live?.detail?.takeIf { it.isNotBlank() },
+                fpSensorMatch.takeIf { it.isNotBlank() }
+            ).joinToString("\n"),
+            breakExplanation = if (link3Status == EvidenceStatus.UNKNOWN) {
+                if (isFr) "Hooks services.jar/framework.jar FOD absents ou non décodables." else "services.jar/framework.jar FOD hooks missing or unreadable."
+            } else ""
+        )
+
+        // 4. SURFACEFLINGER_HBM
+        val hasSfLive = surfaceFlingerLiveDelta.isNotBlank() &&
+            !surfaceFlingerLiveDelta.startsWith("NO_NEW_FOD") &&
+            !surfaceFlingerLiveDelta.startsWith("SURFACEFLINGER_LIVE_UNAVAILABLE")
+        val sfFodHint = Regex("(udfps|fod|hbm|lhbm|dimlayer|colormode).*", RegexOption.IGNORE_CASE)
+            .findAll(dumpsysSurfaceFlinger + "\n" + surfaceFlingerLiveDelta)
+            .map { it.value.trim() }.distinct().take(8).joinToString("\n")
+        val link4Status = when {
+            surfaceFlingerLiveDelta.startsWith("SURFACEFLINGER_LIVE_UNAVAILABLE") && !rootGranted -> EvidenceStatus.UNKNOWN
+            hasSfLive -> EvidenceStatus.CONFIRMED
+            sfFodHint.isNotBlank() -> EvidenceStatus.OBSERVED
+            else -> EvidenceStatus.SUSPECT
+        }
+        val link4 = CausalChainLink(
+            order = 4,
+            layer = "SURFACEFLINGER_HBM",
+            title = if (isFr) "4. Pipeline SurfaceFlinger / HWC HBM" else "4. SurfaceFlinger / HWC HBM Pipeline",
+            componentName = "SurfaceFlinger / ComposerHWC",
+            sourceFile = "/system/bin/surfaceflinger",
+            sourceDirectory = "/system/bin",
+            status = link4Status,
+            proofKind = if (hasSfLive) "LIVE_SF_HBM_CAPTURE" else "DUMPSYS_SURFACEFLINGER",
+            codeExcerpt = sfFodHint,
+            liveRuntimeEvidence = surfaceFlingerLiveDelta.take(500),
+            breakExplanation = if (link4Status == EvidenceStatus.SUSPECT) {
+                if (isFr) "Aucun calque UDFPS/HBM ni changement Z-order/ColorMode capturé pendant l'appui." else "No UDFPS/HBM layer or Z-order/ColorMode change captured during touch."
+            } else ""
+        )
+
+        // 5. BINDER_IPC
+        val allPeers = binderTraces.flatMap { it.linkedPeerProcesses }.distinct()
+        val allTxs = binderTraces.flatMap { it.activeTransactions }.distinct()
+        val halLinks = Regex("(android\\.hardware\\.biometrics\\.fingerprint\\S+|vendor\\.[\\w.]+fingerprint\\S*|vendor\\.[\\w.]+display\\S*)", RegexOption.IGNORE_CASE)
+            .findAll(lshalOutput + "\n" + serviceList)
+            .map { it.value.trim() }.distinct().take(6).toList()
+        val link5Status = when {
+            binderTraces.any { it.activeTransactions.isNotEmpty() || it.linkedPeerProcesses.isNotEmpty() } -> EvidenceStatus.CONFIRMED
+            halLinks.isNotEmpty() -> EvidenceStatus.OBSERVED
+            !rootGranted -> EvidenceStatus.UNKNOWN
+            else -> EvidenceStatus.FAILED
+        }
+        val link5 = CausalChainLink(
+            order = 5,
+            layer = "BINDER_IPC",
+            title = if (isFr) "5. Transactions Binder IPC & VINTF HAL" else "5. Binder IPC & VINTF HAL Links",
+            componentName = binderTraces.joinToString(", ") { "${it.processName}(${it.pid})" }.ifBlank { "binder / hwbinder" },
+            sourceFile = "/dev/binderfs/binder_logs & lshal",
+            sourceDirectory = "/dev/binderfs",
+            status = link5Status,
+            proofKind = if (allTxs.isNotEmpty()) "KERNEL_BINDER_DEBUG" else "BINDER_ENDPOINT_MAP",
+            referencedResourceKeys = halLinks,
+            codeExcerpt = (allPeers.take(10).map { "PEER: $it" } + allTxs.take(10).map { "TX: $it" }).joinToString("\n"),
+            liveRuntimeEvidence = halLinks.joinToString("\n"),
+            breakExplanation = if (link5Status == EvidenceStatus.FAILED) {
+                if (isFr) "Aucune transaction Binder vers un HAL biométrique/FOD enregistrée." else "Zero Binder links to any biometric/FOD HAL recorded."
+            } else ""
+        )
+
+        // 6. HAL_NATIVE_ELF
+        val step5Live = fingerDownChain.firstOrNull { it.order == 5 }
+        val readableElfs = elfAnalyses.filter { it.isReadable }
+        val halThreads = procLiveMaps.filter {
+            it.processName.contains("fingerprint", true) || it.processName.contains("biometrics", true) ||
+                it.processName.contains("goodix", true) || it.processName.contains("fpc", true)
+        }.flatMap { it.activeThreads }.distinct()
+        val link6Status = when {
+            silentHalStall || step5Live?.status == EvidenceStatus.FAILED -> EvidenceStatus.FAILED
+            step5Live?.status == EvidenceStatus.CONFIRMED -> EvidenceStatus.CONFIRMED
+            readableElfs.isNotEmpty() -> EvidenceStatus.OBSERVED
+            else -> EvidenceStatus.UNKNOWN
+        }
+        val link6 = CausalChainLink(
+            order = 6,
+            layer = "HAL_NATIVE_ELF",
+            title = if (isFr) "6. Binaire HAL Natif (.so ELF & Threads)" else "6. Native HAL Binary (.so ELF & Threads)",
+            componentName = readableElfs.firstOrNull()?.path?.substringAfterLast('/')
+                ?: elfAnalyses.firstOrNull()?.path?.substringAfterLast('/')
+                ?: "FingerprintHAL",
+            sourceFile = readableElfs.firstOrNull()?.path ?: elfAnalyses.firstOrNull()?.path ?: "/vendor/bin/hw/*",
+            sourceDirectory = (readableElfs.firstOrNull()?.path ?: "/vendor/lib64").substringBeforeLast('/'),
+            status = link6Status,
+            proofKind = if (readableElfs.isNotEmpty()) "ELF_DISASM_SYMBOL" else "PROC_MAPS_THREAD",
+            referencedResourceKeys = readableElfs.flatMap { it.fodSymbols }.distinct().take(10),
+            codeExcerpt = readableElfs.firstOrNull()?.disassemblyPseudoCode?.take(700).orEmpty()
+                .ifBlank { readableElfs.flatMap { it.fodSymbols }.take(12).joinToString("\n") },
+            liveRuntimeEvidence = listOfNotNull(
+                step5Live?.detail?.takeIf { it.isNotBlank() },
+                halThreads.takeIf { it.isNotEmpty() }?.let { "Threads: ${it.joinToString(", ")}" }
+            ).joinToString("\n"),
+            breakExplanation = if (silentHalStall || link6Status == EvidenceStatus.FAILED) {
+                step5Live?.detail ?: if (isFr) "Le HAL ne renvoie aucun callback onAcquired / onEnrollResult." else "HAL returns zero onAcquired / onEnrollResult callbacks."
+            } else ""
+        )
+
+        // 7. KERNEL_SYSFS
+        val changedSysfs = sysfsTransitions.filter { it.changed }
+        val kernelLines = dmesgDelta.lines().filter {
+            it.isNotBlank() && !it.startsWith("DMESG_UNAVAILABLE") && !it.startsWith("NO_NEW_FOD")
+        }
+        val hasDmesgErr = kernelLines.any { it.contains("avc: denied", true) || it.contains("fail", true) || it.contains("err", true) }
+        val openFodFds = procLiveMaps.flatMap { it.openFds + it.enrollmentNewFds }
+            .filter { it.contains("/dev/", true) || it.contains("/sys/", true) }.distinct()
+        val link7Status = when {
+            hasDmesgErr -> EvidenceStatus.FAILED
+            changedSysfs.isNotEmpty() || kernelLines.isNotEmpty() -> EvidenceStatus.CONFIRMED
+            sysfsTransitions.isNotEmpty() && rootGranted -> EvidenceStatus.SUSPECT
+            else -> EvidenceStatus.UNKNOWN
+        }
+        val link7 = CausalChainLink(
+            order = 7,
+            layer = "KERNEL_SYSFS",
+            title = if (isFr) "7. Pilote Kernel, DRM/HBM & Nœuds Sysfs" else "7. Kernel Driver, DRM/HBM & Sysfs Nodes",
+            componentName = (changedSysfs.firstOrNull() ?: sysfsTransitions.firstOrNull())?.nodePath?.substringAfterLast('/')
+                ?: "DRM / Touch Driver",
+            sourceFile = (changedSysfs.firstOrNull() ?: sysfsTransitions.firstOrNull())?.nodePath ?: "/sys/class/drm/*",
+            sourceDirectory = ((changedSysfs.firstOrNull() ?: sysfsTransitions.firstOrNull())?.nodePath ?: "/sys/class/drm").substringBeforeLast('/'),
+            status = link7Status,
+            proofKind = when {
+                changedSysfs.isNotEmpty() -> "SYSFS_T0_T1_DELTA"
+                kernelLines.isNotEmpty() -> "KERNEL_DMESG_DELTA"
+                else -> "SYSFS_STATIC_POLL"
+            },
+            referencedResourceKeys = openFodFds.take(8),
+            codeExcerpt = kernelLines.take(8).joinToString("\n"),
+            liveRuntimeEvidence = changedSysfs.take(6).joinToString("\n") {
+                "${it.nodePath}: ${it.beforeValue} -> ${it.liveValues} -> ${it.afterValue}"
+            }.ifBlank {
+                sysfsTransitions.take(4).joinToString("\n") { "${it.nodePath}: static(${it.beforeValue})" }
+            },
+            breakExplanation = when (link7Status) {
+                EvidenceStatus.FAILED -> kernelLines.firstOrNull { it.contains("avc: denied", true) || it.contains("err", true) }.orEmpty()
+                EvidenceStatus.SUSPECT -> if (isFr) "${sysfsTransitions.size} nœuds sysfs surveillés mais aucune transition HBM/FOD ni dmesg kernel pendant l'appui." else "${sysfsTransitions.size} sysfs nodes polled yet zero HBM/FOD transition or kernel dmesg events."
+                else -> ""
+            }
+        )
+
+        return listOf(link1, link2, link3, link4, link5, link6, link7)
     }
 
     private fun reconstructFingerDownChain(
@@ -772,102 +1091,76 @@ object PatchAndArchitectureAnalyzer {
             }
 
         val seenOverlayPkgs = linkedSetOf<String>()
-        val overlayEntries = baseline.dumpsysOverlay.lineSequence()
-            .map { it.trim() }
-            .filter { line ->
-                val l = line.lowercase()
-                l.startsWith("[x]") || l.startsWith("[ ]") || l.contains("state_enabled") ||
-                    l.contains("fod") || l.contains("udfps") || l.contains("treble") ||
-                    l.contains("fingerprint") || l.contains("biometric") || l.contains("systemui") ||
-                    l.contains("overlay")
-            }
-            .mapNotNull { trimmed ->
-                val enabled = trimmed.startsWith("[x]", true) || trimmed.contains("STATE_ENABLED")
-                val pkg = trimmed.removePrefix("[x]").removePrefix("[ ]").trim().substringBefore(":").substringBefore(" ")
-                if (pkg.isBlank()) null else Triple(pkg, enabled, trimmed)
-            }
-            .distinctBy { it.first }
-            .sortedWith(
-                compareByDescending<Triple<String, Boolean, String>> { overlayByPkg[it.first]?.fodRelevanceScore ?: -1 }
-                    .thenByDescending { overlayByPkg[it.first]?.provenInLiveMaps == true }
-                    .thenByDescending { it.second }
-                    .thenBy { it.first }
-            )
-            .take(80)
+        val inspectorAlreadyFiltered = baseline.overlayInspections.isNotEmpty() || baseline.filteredNonFodOverlayCount > 0
+        val overlayEntries = if (inspectorAlreadyFiltered) {
+            emptyList<Triple<String, Boolean, String>>()
+        } else {
+            baseline.dumpsysOverlay.lineSequence()
+                .map { it.trim() }
+                .filter { line ->
+                    val l = line.lowercase()
+                    l.contains("fod") || l.contains("udfps") || l.contains("fingerprint") || l.contains("biometric")
+                }
+                .mapNotNull { trimmed ->
+                    val enabled = trimmed.startsWith("[x]", true) || trimmed.contains("STATE_ENABLED")
+                    val pkg = trimmed.removePrefix("[x]").removePrefix("[ ]").trim().substringBefore(":").substringBefore(" ")
+                    if (pkg.isBlank()) null else Triple(pkg, enabled, trimmed)
+                }
+                .distinctBy { it.first }
+                .sortedWith(
+                    compareByDescending<Triple<String, Boolean, String>> { it.second }.thenBy { it.first }
+                )
+                .take(40)
+                .toList()
+        }
 
         overlayEntries.forEachIndexed { idx, (pkg, enabled, trimmed) ->
             seenOverlayPkgs += pkg
             val deep = overlayByPkg[pkg]
             val resolvedApk = deep?.apkPath?.takeIf { it != "UNKNOWN" } ?: pkg
             val resolvedDir = deep?.directory?.takeIf { it != "UNKNOWN" } ?: "UNKNOWN"
-            val keyEntriesPreview = (deep?.decodedArscEntries.orEmpty() + deep?.fodConfigEntries.orEmpty())
-                .distinct().take(6).joinToString(" ; ")
             patches += DetectedPatch(
                 id = "patch_rro_$idx",
                 name = pkg,
-                source = if (deep != null && deep.apkPath != "UNKNOWN") "OverlayManager (${deep.apkPath})" else "OverlayManager (cmd overlay list)",
-                scope = if ((deep?.fodRelevanceScore ?: 0) >= 40) "Proven FOD RRO Overlay" else "RRO Overlay",
+                source = "OverlayManager (cmd overlay list)",
+                scope = "RRO Overlay",
                 target = deep?.targetPackage?.takeIf { it.isNotBlank() } ?: pkg,
                 rawValue = if (enabled) "ENABLED" else "DISABLED/STATE_OTHER",
-                status = when {
-                    enabled && (deep?.fodRelevanceScore ?: 0) >= 40 -> EvidenceStatus.CONFIRMED
-                    enabled -> EvidenceStatus.OBSERVED
-                    else -> EvidenceStatus.OBSERVED
-                },
-                realObservedEffect = when {
-                    (deep?.lookupWinners?.isNotEmpty() == true) -> "Active lookup winner (${deep.lookupWinners.size} key(s))"
-                    (deep?.fodRelevanceScore ?: 0) >= 40 -> "Contains decoded FOD ARSC/XML overrides (score=${deep?.fodRelevanceScore})"
-                    enabled -> "Active RRO overlay"
-                    else -> "Present but inactive"
-                },
-                note = buildString {
-                    append(trimmed)
-                    if (deep != null) {
-                        append(" | score=${deep.fodRelevanceScore} | liveMapped=${deep.provenInLiveMaps} | APK=${deep.apkPath} | Dir=$resolvedDir | target=${deep.targetPackage} | prio=${deep.priority}")
-                        if (deep.lookupWinners.isNotEmpty()) append(" | Lookup: ${deep.lookupWinners.take(3).joinToString("; ")}")
-                        if (keyEntriesPreview.isNotBlank()) append(" | Keys: $keyEntriesPreview")
-                    }
-                }
+                status = if (enabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
+                realObservedEffect = if (enabled) "Active FOD-named RRO overlay (uninspected binary)" else "Present but inactive",
+                note = trimmed
             )
             components += DiscoveredComponent(
                 id = "overlay_${idx}_${pkg.hashCode()}",
                 name = pkg,
                 category = ComponentCategory.OVERLAY,
                 version = if (enabled) "ENABLED" else "INACTIVE",
-                interfaceType = if (deep?.targetPackage?.isNotBlank() == true) "RRO -> ${deep.targetPackage}" else "RRO",
+                interfaceType = "RRO",
                 path = resolvedApk,
                 status = if (enabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
                 knowledgeLevel = KnowledgeLevel.FACT,
-                metadata = buildMap {
-                    put("apkPath", deep?.apkPath ?: "UNKNOWN")
-                    put("directory", resolvedDir)
-                    if (deep != null) {
-                        put("fodRelevanceScore", deep.fodRelevanceScore.toString())
-                        put("provenInLiveMaps", deep.provenInLiveMaps.toString())
-                        if (deep.lookupWinners.isNotEmpty()) put("lookupWinners", deep.lookupWinners.joinToString(" | ").take(240))
-                        if (deep.decodedArscEntries.isNotEmpty()) put("decodedArscEntries", deep.decodedArscEntries.take(8).joinToString(" | ").take(280))
-                        if (deep.targetPackage.isNotBlank()) put("targetPackage", deep.targetPackage)
-                        put("priority", deep.priority.toString())
-                    }
-                    if (keyEntriesPreview.isNotBlank()) put("internalKeys", keyEntriesPreview.take(240))
-                }
+                metadata = mapOf("directory" to resolvedDir)
             )
         }
 
-        // Also include deep-inspected overlays discovered via dumpsys overlay / partitions that weren't in cmd overlay list lines
+        // Strict proven FOD RRO overlays from DynamicProvenanceInspector (zero generic UI noise!)
         baseline.overlayInspections.filter { it.packageName !in seenOverlayPkgs }.forEachIndexed { idx, deep ->
             seenOverlayPkgs += deep.packageName
-            val keyEntriesPreview = (deep.decodedArscEntries + deep.fodConfigEntries).distinct().take(6).joinToString(" ; ")
+            val keyEntriesPreview = (deep.bytecodeMatchedResourceKeys + deep.decodedArscEntries + deep.fodConfigEntries).distinct().take(6).joinToString(" ; ")
             patches += DetectedPatch(
                 id = "patch_rro_deep_$idx",
                 name = deep.packageName,
                 source = "OverlayManager (${deep.apkPath})",
-                scope = if (deep.fodRelevanceScore >= 40) "Proven FOD RRO Overlay" else "RRO Overlay",
+                scope = if (deep.isStrictProvenFod) "Strict Proven FOD RRO Overlay" else "RRO Overlay",
                 target = deep.targetPackage.ifBlank { deep.packageName },
                 rawValue = if (deep.isEnabled) "ENABLED" else "DISABLED/STATE_OTHER",
-                status = if (deep.isEnabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
-                realObservedEffect = if (deep.fodRelevanceScore >= 40) "Decoded FOD ARSC/XML (score=${deep.fodRelevanceScore})" else if (deep.isEnabled) "Active RRO overlay" else "Present but inactive",
-                note = "score=${deep.fodRelevanceScore} | liveMapped=${deep.provenInLiveMaps} | APK=${deep.apkPath} | Dir=${deep.directory} | target=${deep.targetPackage} | Keys: $keyEntriesPreview"
+                status = if (deep.isEnabled && deep.isStrictProvenFod) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
+                realObservedEffect = when {
+                    deep.bytecodeMatchedResourceKeys.isNotEmpty() -> "Bytecode R.id match (${deep.bytecodeMatchedResourceKeys.size} keys)"
+                    deep.lookupWinners.isNotEmpty() -> "Active lookup winner (${deep.lookupWinners.size} keys)"
+                    else -> "Decoded FOD ARSC/XML (score=${deep.fodRelevanceScore})"
+                },
+                note = "strict=${deep.isStrictProvenFod} | score=${deep.fodRelevanceScore} | liveMapped=${deep.provenInLiveMaps} | APK=${deep.apkPath} | Dir=${deep.directory} | target=${deep.targetPackage} | Keys: $keyEntriesPreview"
             )
             components += DiscoveredComponent(
                 id = "overlay_deep_${idx}_${deep.packageName.hashCode()}",
@@ -876,13 +1169,15 @@ object PatchAndArchitectureAnalyzer {
                 version = if (deep.isEnabled) "ENABLED" else "INACTIVE",
                 interfaceType = if (deep.targetPackage.isNotBlank()) "RRO -> ${deep.targetPackage}" else "RRO",
                 path = deep.apkPath.takeIf { it != "UNKNOWN" } ?: deep.packageName,
-                status = if (deep.isEnabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
+                status = if (deep.isEnabled && deep.isStrictProvenFod) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
                 knowledgeLevel = KnowledgeLevel.FACT,
                 metadata = buildMap {
                     put("apkPath", deep.apkPath)
                     put("directory", deep.directory)
+                    put("strictProven", deep.isStrictProvenFod.toString())
                     put("fodRelevanceScore", deep.fodRelevanceScore.toString())
                     put("provenInLiveMaps", deep.provenInLiveMaps.toString())
+                    if (deep.bytecodeMatchedResourceKeys.isNotEmpty()) put("bytecodeMatchedKeys", deep.bytecodeMatchedResourceKeys.joinToString(" | ").take(240))
                     if (deep.lookupWinners.isNotEmpty()) put("lookupWinners", deep.lookupWinners.joinToString(" | ").take(240))
                     if (deep.decodedArscEntries.isNotEmpty()) put("decodedArscEntries", deep.decodedArscEntries.take(8).joinToString(" | ").take(280))
                     if (deep.targetPackage.isNotBlank()) put("targetPackage", deep.targetPackage)

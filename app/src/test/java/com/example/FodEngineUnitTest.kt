@@ -1,7 +1,9 @@
 package com.example
 
+import com.example.engine.ArscEntryRecord
 import com.example.engine.BaselineProbeResult
 import com.example.engine.BinarySourceDecoder
+import com.example.engine.DalvikBytecodeDecoder
 import com.example.engine.DynamicProvenanceInspector
 import com.example.engine.ElfDisassembler
 import com.example.engine.FodComparatorEngine
@@ -11,8 +13,10 @@ import com.example.engine.PortZipDeepReader
 import com.example.engine.ShellExecutor
 import com.example.engine.SystemProbeCollector
 import com.example.i18n.AppLanguage
+import com.example.model.BinderTraceRecord
 import com.example.model.ComponentCategory
 import com.example.model.DetectedPatch
+import com.example.model.DexMethodTrace
 import com.example.model.DiagnosticMode
 import com.example.model.DiagnosticSummary
 import com.example.model.DiscoveredComponent
@@ -1108,7 +1112,329 @@ class FodEngineUnitTest {
         assertTrue(hal.mappedLibs.contains("/vendor/lib64/libgf_hal.so"))
         assertTrue(hal.enrollmentNewMappedFiles.contains("/vendor/lib64/libgf_udfps_algo.so"))
     }
+
+    private fun buildSyntheticDexWithCodeItem(): Pair<ByteArray, Map<Int, ArscEntryRecord>> {
+        fun uleb(v: Int): ByteArray {
+            val out = ByteArrayOutputStream()
+            var value = v
+            do {
+                var b = value and 0x7F
+                value = value ushr 7
+                if (value != 0) b = b or 0x80
+                out.write(b)
+            } while (value != 0)
+            return out.toByteArray()
+        }
+
+        val strings = listOf(
+            "Lcom/android/systemui/biometrics/UdfpsController;", // 0
+            "Lcom/android/systemui/biometrics/UdfpsView;",       // 1
+            "/sys/class/drm/card0-DSI-1/disp_param",             // 2
+            "V",                                                 // 3
+            "onFingerDown",                                      // 4
+            "extCmd"                                             // 5
+        )
+        // Header (112) + string_ids (24) + type_ids (12) + proto_ids (12) + method_ids (16) + class_defs (32) = 208
+        val dataBase = 208
+        val dataBuf = ByteArrayOutputStream()
+
+        // String data
+        val strOffs = IntArray(strings.size)
+        strings.forEachIndexed { idx, s ->
+            strOffs[idx] = dataBase + dataBuf.size()
+            dataBuf.write(uleb(s.length))
+            dataBuf.write(s.toByteArray(Charsets.UTF_8))
+            dataBuf.write(0)
+        }
+        // Align 4 bytes before code_item
+        while ((dataBase + dataBuf.size()) % 4 != 0) dataBuf.write(0)
+
+        // code_item (header 16 bytes + 9 uint16 code units = 34 bytes):
+        //   0..1: const v0, #0x7f010000 (opcode 0x14, reg 0x00 -> 0x0014; lo16=0x0000, hi16=0x7f01)
+        //   3..4: const-string v1, string@2 (opcode 0x1a, reg 0x01 -> 0x011a; strIdx=2)
+        //   5..7: invoke-virtual {}, method@1 (extCmd) (opcode 0x6e -> 0x006e; methodIdx=1; regs=0)
+        //   8:    return-void (0x000e)
+        val codeOff = dataBase + dataBuf.size()
+        val codeUnits = 9
+        val codeBytes = ByteBuffer.allocate(16 + codeUnits * 2).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(2.toShort()) // registers_size
+            putShort(0.toShort()) // ins_size
+            putShort(0.toShort()) // outs_size
+            putShort(0.toShort()) // tries_size
+            putInt(0)             // debug_info_off
+            putInt(codeUnits)     // insns_size
+            // const v0, #0x7f010000
+            putShort(0x0014.toShort())
+            putInt(0x7f010000)
+            // const-string v1, string@2
+            putShort(0x011a.toShort())
+            putShort(2.toShort())
+            // invoke-virtual {}, method@1 (extCmd)
+            putShort(0x006e.toShort())
+            putShort(1.toShort())
+            putShort(0x0000.toShort())
+            // return-void
+            putShort(0x000e.toShort())
+        }.array()
+        dataBuf.write(codeBytes)
+
+        // class_data_item: 0 static, 0 instance, 1 direct method (method_idx=0, access=1, code_off=codeOff), 0 virtual
+        val classDataOff = dataBase + dataBuf.size()
+        dataBuf.write(uleb(0))
+        dataBuf.write(uleb(0))
+        dataBuf.write(uleb(1))
+        dataBuf.write(uleb(0))
+        dataBuf.write(uleb(0)) // method_idx diff = 0
+        dataBuf.write(uleb(1)) // access_flags
+        dataBuf.write(uleb(codeOff))
+
+        val payload = dataBuf.toByteArray()
+        val fileSize = dataBase + payload.size
+        val dexBytes = ByteBuffer.allocate(fileSize).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put("dex\n035\u0000".toByteArray(Charsets.US_ASCII))
+            putInt(0)
+            put(ByteArray(20))
+            putInt(fileSize) // 32
+            putInt(112)      // 36 header_size
+            putInt(0x12345678) // 40 endian_tag
+            putInt(0); putInt(0) // link 44..52
+            putInt(0) // map_off 52
+            putInt(strings.size); putInt(112) // string_ids 56..64
+            putInt(3); putInt(136) // type_ids 64..72
+            putInt(1); putInt(148) // proto_ids 72..80
+            putInt(0); putInt(0)   // field_ids 80..88
+            putInt(2); putInt(160) // method_ids 88..96
+            putInt(1); putInt(176) // class_defs 96..104
+            putInt(payload.size); putInt(dataBase) // data 104..112
+
+            strOffs.forEach { putInt(it) } // 112..136
+            putInt(0); putInt(1); putInt(3) // type_ids 136..148
+            putInt(3); putInt(2); putInt(0) // proto_ids 148..160
+            // method_ids 160..176: 0=onFingerDown, 1=extCmd
+            putShort(0.toShort()); putShort(0.toShort()); putInt(4)
+            putShort(1.toShort()); putShort(0.toShort()); putInt(5)
+            // class_defs 176..208
+            putInt(0) // class_idx
+            putInt(1) // access_flags
+            putInt(1) // superclass_idx
+            putInt(0); putInt(0); putInt(0)
+            putInt(classDataOff) // class_data_off
+            putInt(0)
+            put(payload)
+        }.array()
+
+        val arscIdMap = mapOf(
+            0x7f010000 to ArscEntryRecord(
+                typeName = "bool",
+                keyName = "config_supportsUdfps",
+                valueText = "true",
+                packageName = "com.android.systemui",
+                resId = 0x7f010000
+            )
+        )
+        return dexBytes to arscIdMap
+    }
+
+    @Test
+    fun dalvikBytecodeDecoder_resolvesArscResourceIdConstStringsAndInvokedCalls() {
+        val (dexBytes, arscIdMap) = buildSyntheticDexWithCodeItem()
+        val matchedClasses = linkedSetOf<String>()
+        val matchedMethods = linkedSetOf<String>()
+        val matchedStrings = linkedSetOf<String>()
+        val methodTraces = mutableListOf<DexMethodTrace>()
+        val referencedResIds = linkedSetOf<Int>()
+        val resolvedResKeys = linkedSetOf<String>()
+
+        DalvikBytecodeDecoder.parseSingleDexWithBytecode(
+            dexBytes = dexBytes,
+            arscIdMap = arscIdMap,
+            matchedClasses = matchedClasses,
+            matchedMethods = matchedMethods,
+            matchedStrings = matchedStrings,
+            methodTraces = methodTraces,
+            referencedResIds = referencedResIds,
+            resolvedResourceKeys = resolvedResKeys
+        )
+
+        assertTrue(referencedResIds.contains(0x7f010000))
+        assertTrue(resolvedResKeys.contains("com.android.systemui:bool/config_supportsUdfps"))
+        assertTrue(matchedStrings.contains("/sys/class/drm/card0-DSI-1/disp_param"))
+        assertTrue(methodTraces.any { tr ->
+            tr.fqMethod.contains("UdfpsController.fun onFingerDown") &&
+                tr.invokedMethods.any { it.contains("UdfpsView.fun extCmd") } &&
+                tr.resolvedResKeys.contains("com.android.systemui:bool/config_supportsUdfps")
+        })
+    }
+
+    @Test
+    fun binarySourceDecoder_carvesDexFromSyntheticVdexAndDecodesFodSymbols() {
+        val (dexBytes, arscIdMap) = buildSyntheticDexWithCodeItem()
+        val vdexHeader = ByteArray(128).apply {
+            "vdex027\u0000".toByteArray(Charsets.US_ASCII).copyInto(this, 0)
+        }
+        val trailer = ByteArray(32)
+        val vdexContainer = vdexHeader + dexBytes + trailer
+
+        val extracted = BinarySourceDecoder.extractFodDexSourcesFromVdexOrOat(
+            containerBytes = vdexContainer,
+            containerPath = "/system_ext/priv-app/SystemUI/oat/arm64/SystemUI.vdex",
+            targetHint = "SystemUI UDFPS/HBM Controller",
+            arscIdMap = arscIdMap
+        )
+
+        assertTrue(extracted != null)
+        assertTrue(extracted!!.containerType.startsWith("VDEX/ODEX"))
+        assertTrue(extracted.matchedClasses.any { it.contains("UdfpsController") })
+        assertTrue(extracted.resolvedResourceKeys.contains("com.android.systemui:bool/config_supportsUdfps"))
+        assertTrue(extracted.methodTraces.isNotEmpty())
+    }
+
+    @Test
+    fun systemProbeCollector_parsesThreadsAndBinderTraceRoundTrip() {
+        val pidNames = mapOf(1200 to "com.android.systemui", 450 to "vendor.goodix.fp")
+        val rawMaps = """
+            === PID 1200 ===
+            /system_ext/priv-app/SystemUI/SystemUI.apk
+            --- FD 1200 ---
+            /dev/binder
+            --- THR 1200 ---
+            UdfpsHandler
+            Binder:1200_3
+        """.trimIndent()
+
+        val maps = SystemProbeCollector.parseProcMapsOutput(rawMaps, pidNames)
+        assertEquals(1, maps.size)
+        assertTrue(maps[0].activeThreads.contains("UdfpsHandler"))
+        assertTrue(maps[0].activeThreads.contains("Binder:1200_3"))
+
+        val rawBinder = """
+            === BINDER_PID 1200 ===
+            node 42: u00000000
+            ref 7: desc 3 node 99 proc 450
+            outgoing transaction 555: 0 from 1200:1205 to 450:451 code 9
+        """.trimIndent()
+
+        val traces = SystemProbeCollector.parseBinderDebugOutput(rawBinder, pidNames)
+        assertEquals(1, traces.size)
+        assertEquals(1, traces[0].incomingNodes)
+        assertEquals(1, traces[0].outgoingRefs)
+        assertTrue(traces[0].linkedPeerProcesses.contains("vendor.goodix.fp(450)"))
+        assertTrue(traces[0].activeTransactions.any { it.contains("outgoing transaction 555") })
+
+        val serialized = SystemProbeCollector.serializeBinderTraces(traces)
+        val parsedBack = SystemProbeCollector.parseBinderTraceText(serialized)
+        assertEquals(traces.size, parsedBack.size)
+        assertEquals(traces[0].processName, parsedBack[0].processName)
+        assertEquals(traces[0].linkedPeerProcesses, parsedBack[0].linkedPeerProcesses)
+    }
+
+    @Test
+    fun zeroFalsePositiveOverlayAndCausalChain_populatesAllStagesAndRejectsUnrelatedOverlay() {
+        val provenFod = OverlayDeepInspection(
+            packageName = "org.vendor.device.udfps.overlay",
+            targetPackage = "com.android.systemui",
+            apkPath = "/product/overlay/DeviceUdfpsOverlay.apk",
+            directory = "/product/overlay",
+            isEnabled = true,
+            isStatic = true,
+            priority = 10,
+            provenInLiveMaps = true,
+            isStrictProvenFod = true,
+            bytecodeMatchedResourceKeys = listOf("com.android.systemui:bool/config_supportsUdfps"),
+            lookupWinners = listOf("com.android.systemui:bool/config_supportsUdfps -> overlay://DeviceUdfpsOverlay.apk"),
+            decodedArscEntries = listOf("ARSC bool/config_supportsUdfps = true"),
+            fodConfigEntries = listOf("VALUE bool/config_supportsUdfps = true")
+        ).let { it.copy(fodRelevanceScore = DynamicProvenanceInspector.computeFodOverlayScore(it) + 55) }
+
+        val unrelatedUi = OverlayDeepInspection(
+            packageName = "com.android.theme.icon_pack.rounded",
+            targetPackage = "android",
+            apkPath = "/product/overlay/IconPackRounded.apk",
+            directory = "/product/overlay",
+            isEnabled = true,
+            isStatic = false,
+            priority = 1,
+            isStrictProvenFod = false,
+            fodRelevanceScore = 5
+        )
+
+        val serializedOverlays = DynamicProvenanceInspector.serializeOverlayDeepInspect(
+            list = listOf(provenFod, unrelatedUi),
+            filteredNonFodCount = 5
+        )
+        val binderText = SystemProbeCollector.serializeBinderTraces(
+            listOf(
+                BinderTraceRecord(
+                    pid = 1200,
+                    processName = "com.android.systemui",
+                    incomingNodes = 2,
+                    outgoingRefs = 4,
+                    activeTransactions = listOf("binder_ref(desc=3 -> node=99)"),
+                    linkedPeerProcesses = listOf("vendor.goodix.fp(450)")
+                )
+            )
+        )
+        val dexText = """
+            === DEX & VDEX BYTECODE SOURCE EXTRACT (1) ===
+            DEX_ARCHIVE: /system_ext/priv-app/SystemUI/SystemUI.apk (SystemUI UDFPS/HBM Controller) [APK/JAR]
+              RES_KEY: com.android.systemui:bool/config_supportsUdfps
+              TRACE_METHOD: com.android.systemui.biometrics.UdfpsController.fun onFingerDown(): void
+                TRACE_RES: com.android.systemui:bool/config_supportsUdfps
+                TRACE_CALL: com.android.systemui.biometrics.UdfpsView.fun extCmd(): void
+                TRACE_STR: /sys/class/drm/card0-DSI-1/disp_param
+        """.trimIndent()
+
+        fun zipFrom(map: Map<String, String>): ByteArray {
+            val baos = ByteArrayOutputStream()
+            ZipOutputStream(baos).use { z ->
+                map.forEach { (name, content) ->
+                    z.putNextEntry(ZipEntry(name))
+                    z.write(content.toByteArray(Charsets.UTF_8))
+                    z.closeEntry()
+                }
+            }
+            return baos.toByteArray()
+        }
+
+        val romZip = PortZipDeepReader.readCompleteZipStream(
+            ByteArrayInputStream(
+                zipFrom(
+                    mapOf(
+                        "metadata/environment.txt" to "Boot Signature: 4.14.357\nVendor Fingerprint: device_fp",
+                        "raw/dumpsys_overlay.txt" to "[x] org.vendor.device.udfps.overlay\n[x] com.android.theme.icon_pack.rounded\n",
+                        "raw/overlay_deep_inspect.txt" to serializedOverlays,
+                        "raw/dex_source_extract.txt" to dexText,
+                        "raw/binder_trace_delta.txt" to binderText
+                    )
+                )
+            ),
+            "ROM",
+            "rom_causal.zip"
+        )
+        val gsiZip = PortZipDeepReader.readCompleteZipStream(
+            ByteArrayInputStream(
+                zipFrom(
+                    mapOf(
+                        "metadata/environment.txt" to "Boot Signature: 4.14.357\nVendor Fingerprint: device_fp",
+                        "raw/dumpsys_overlay.txt" to "[x] org.treble.generic\n"
+                    )
+                )
+            ),
+            "GSI",
+            "gsi_causal.zip"
+        )
+
+        val result = PortAnalysisEngine.analyze(romZip, gsiZip, AppLanguage.FR)
+        assertEquals(7, result.romCausalChain.size)
+        assertEquals(7, result.gsiCausalChain.size)
+        assertTrue(result.causalBreakSummary.isNotBlank())
+        assertTrue("Expected filteredNonFodOverlayCount >= 5, got ${result.filteredNonFodOverlayCount}", result.filteredNonFodOverlayCount >= 5)
+        assertTrue(result.extractableFiles.any { it.title == "org.vendor.device.udfps.overlay" })
+        assertFalse(result.extractableFiles.any { it.title == "com.android.theme.icon_pack.rounded" })
+        assertTrue(result.sharedNoiseSamples.any { it.title == "com.android.theme.icon_pack.rounded" })
+    }
 }
+
 
 
 

@@ -75,6 +75,7 @@ import com.example.model.ExtractableFileItem
 import com.example.model.PortingCandidateSolution
 import com.example.model.RawZipArchiveBundle
 import com.example.ui.components.KnowledgeBadge
+import com.example.ui.components.PortCausalComparisonSection
 import com.example.ui.components.StatusPill
 import com.example.ui.components.TelemetrySectionCard
 import com.example.ui.theme.LocalFodStatusColors
@@ -375,6 +376,16 @@ fun PortScreen(
                         TelemetrySectionCard(borderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)) {
                             Text(strings.portSubTabVerdict, style = MaterialTheme.typography.titleSmall)
                             Text(result.factualRootCauseVerdict, style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                    if (result.romCausalChain.isNotEmpty()) {
+                        item {
+                            PortCausalComparisonSection(
+                                romChain = result.romCausalChain,
+                                gsiChain = result.gsiCausalChain,
+                                breakSummary = result.causalBreakSummary,
+                                filteredNonFodOverlayCount = result.filteredNonFodOverlayCount
+                            )
                         }
                     }
                     item {

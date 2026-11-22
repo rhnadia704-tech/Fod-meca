@@ -82,6 +82,7 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
     private var enrollmentStartedAtMs: Long = 0L
     private val liveSysfsHistory = LinkedHashMap<String, MutableList<String>>()
     private val liveSfLayers = LinkedHashSet<String>()
+    private val liveSfLayerDetails = LinkedHashSet<String>()
     private var livePollJob: Job? = null
 
     init {
@@ -111,6 +112,7 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
         livePollJob?.cancel()
         liveSysfsHistory.clear()
         liveSfLayers.clear()
+        liveSfLayerDetails.clear()
         viewModelScope.launch {
             _capturePhase.value = CapturePhase.ScanningBaseline
             _aiState.value = AiSynthesisState.Idle
@@ -143,6 +145,7 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
                             }
                         }
                         liveSfLayers.addAll(poll.surfaceFlingerFodLayers)
+                        liveSfLayerDetails.addAll(poll.sfLayerDetails)
                         _capturePhase.value = CapturePhase.WaitingForEnrollment(
                             elapsedSeconds = ((System.currentTimeMillis() - enrollmentStartedAtMs) / 1000L).toInt(),
                             observedLiveEvents = poll.observedLogCount + poll.newDmesgCount + poll.surfaceFlingerFodLayers.size,
@@ -164,6 +167,7 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
         pendingBaseline = null
         liveSysfsHistory.clear()
         liveSfLayers.clear()
+        liveSfLayerDetails.clear()
         _capturePhase.value = CapturePhase.Idle
     }
 
@@ -181,7 +185,8 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
                 val finalDiff = probeCollector.captureFinalSessionDiff(
                     baseline = baseline,
                     liveSysfsHistory = liveSysfsHistory.mapValues { it.value.toList() },
-                    liveObservedSfLayers = liveSfLayers.toSet()
+                    liveObservedSfLayers = liveSfLayers.toSet(),
+                    liveObservedSfDetails = liveSfLayerDetails.toList()
                 )
                 val report = PatchAndArchitectureAnalyzer.buildReport(
                     mode = _selectedMode.value,
@@ -194,7 +199,9 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
                     surfaceFlingerLiveDelta = finalDiff.surfaceFlingerLiveDelta,
                     sysfsTransitions = finalDiff.sysfsTransitions,
                     procLiveMaps = finalDiff.procLiveMaps,
-                    procLiveMapsText = finalDiff.procLiveMapsText
+                    procLiveMapsText = finalDiff.procLiveMapsText,
+                    binderTraces = finalDiff.binderTraces,
+                    binderTraceDeltaText = finalDiff.binderTraceDeltaText
                 )
                 sessionRepo.saveLatestReport(report)
                 _currentReport.value = report

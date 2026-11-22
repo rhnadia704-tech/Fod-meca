@@ -17,7 +17,8 @@ data class DynamicProvenanceBundle(
     val dexSourceExtracts: List<DexSourceExtract>,
     val overlayDeepInspectText: String,
     val fileProvenanceIndexText: String,
-    val dexSourceExtractText: String
+    val dexSourceExtractText: String,
+    val filteredNonFodOverlayCount: Int = 0
 )
 
 object DynamicProvenanceInspector {
@@ -67,20 +68,37 @@ object DynamicProvenanceInspector {
         accessLimitations: MutableList<String>,
         procLiveMaps: List<LiveProcessMapRecord> = emptyList()
     ): DynamicProvenanceBundle {
-        val overlayInspections = inspectOverlays(
+        val provenance = mutableListOf<FileProvenanceArtifact>()
+
+        // 1. FIRST: Discover SystemUI / Framework / Services / Biometric APEX APK/JAR/VDEX containers & decode Dalvik bytecode + 0x7f.. R.id maps!
+        val (sysFwProv, dexExtracts) = discoverSystemUiAndFrameworkProvenance(
             context = context,
-            dumpsysOverlayList = dumpsysOverlayList,
-            installedPackages = installedOverlayPackages,
             effectiveRoot = effectiveRoot,
             procLiveMaps = procLiveMaps
         )
 
-        val provenance = mutableListOf<FileProvenanceArtifact>()
+        // Exact resource keys actually consumed inside FOD/UDFPS/Biometric Dalvik bytecode
+        val bytecodeConsumedResKeys = dexExtracts
+            .flatMap { it.resolvedResourceKeys }
+            .filter { !it.startsWith("0x") }
+            .toSet()
 
-        // 1. Add all content-ranked overlays as provenance entries
-        overlayInspections.forEachIndexed { idx, ov ->
+        // 2. Inspect overlays & prove strictly against bytecode R.id keys + cmd overlay lookup + /proc/<pid>/maps (ZERO false positives!)
+        val (strictOverlays, filteredOverlayCount) = inspectOverlays(
+            context = context,
+            dumpsysOverlayList = dumpsysOverlayList,
+            installedPackages = installedOverlayPackages,
+            effectiveRoot = effectiveRoot,
+            procLiveMaps = procLiveMaps,
+            bytecodeConsumedResKeys = bytecodeConsumedResKeys
+        )
+
+        strictOverlays.forEachIndexed { idx, ov ->
             val contents = mutableListOf<String>()
-            contents += "fodScore=${ov.fodRelevanceScore} | liveMapped=${ov.provenInLiveMaps} | target=${ov.targetPackage.ifBlank { "UNKNOWN" }} | enabled=${ov.isEnabled} | static=${ov.isStatic} | prio=${ov.priority}"
+            contents += "strictProven=${ov.isStrictProvenFod} | fodScore=${ov.fodRelevanceScore} | liveMapped=${ov.provenInLiveMaps} | target=${ov.targetPackage.ifBlank { "UNKNOWN" }} | enabled=${ov.isEnabled} | static=${ov.isStatic} | prio=${ov.priority}"
+            if (ov.bytecodeMatchedResourceKeys.isNotEmpty()) {
+                contents += "bytecodeMatchedKeys=${ov.bytecodeMatchedResourceKeys.joinToString("; ")}"
+            }
             if (ov.lookupWinners.isNotEmpty()) {
                 contents += "lookupWinners=${ov.lookupWinners.joinToString("; ")}"
             }
@@ -93,44 +111,40 @@ object DynamicProvenanceInspector {
                 filePath = ov.apkPath,
                 directory = ov.directory,
                 matchedSymbolOrKey = ov.packageName,
-                importantContents = contents.distinct().take(36),
+                importantContents = contents.distinct().take(40),
                 accessNote = if (ov.apkPath == "UNKNOWN") "APK path unresolved on device" else null
             )
         }
 
-        // 2. Dynamic .prop files provenance scan
+        // 3. Dynamic .prop files provenance scan
         provenance += discoverPropFilesProvenance(getpropAll, effectiveRoot, accessLimitations)
 
-        // 3. Parse init.rc provenance directly from dynamic grep + file grouping
+        // 4. Parse init.rc provenance directly from dynamic grep + file grouping
         provenance += buildInitRcProvenance(initRcSnippets)
 
-        // 4. Dynamic XML discovery (permissions, sysconfig, displayconfig, vintf)
+        // 5. Dynamic XML discovery (permissions, sysconfig, displayconfig, vintf)
         val extraHalKeywords = extractDynamicHalKeywords(lshalOutput, vintfManifests)
         provenance += discoverSystemXmlProvenance(effectiveRoot, extraHalKeywords)
 
-        // 5. Dynamic SELinux policy files (.cil / contexts / policy)
+        // 6. Dynamic SELinux policy files (.cil / contexts / policy)
         provenance += discoverSelinuxPolicyProvenance(effectiveRoot)
 
-        // 6. Dynamic SystemUI / Framework / Biometric APEX locator & multi-DEX source extraction
-        val (sysFwProv, dexExtracts) = discoverSystemUiAndFrameworkProvenance(
-            context = context,
-            effectiveRoot = effectiveRoot,
-            procLiveMaps = procLiveMaps
-        )
+        // 7. SystemUI / Framework bytecode artifacts
         provenance += sysFwProv
 
         val distinctProvenance = provenance.distinctBy { "${it.category}::${it.filePath}::${it.matchedSymbolOrKey}" }
-        val overlayText = serializeOverlayDeepInspect(overlayInspections)
+        val overlayText = serializeOverlayDeepInspect(strictOverlays, filteredOverlayCount)
         val provenanceText = serializeFileProvenanceIndex(distinctProvenance)
         val dexText = serializeDexSourceExtracts(dexExtracts)
 
         return DynamicProvenanceBundle(
-            overlayInspections = overlayInspections,
+            overlayInspections = strictOverlays,
             fileProvenance = distinctProvenance,
             dexSourceExtracts = dexExtracts,
             overlayDeepInspectText = overlayText,
             fileProvenanceIndexText = provenanceText,
-            dexSourceExtractText = dexText
+            dexSourceExtractText = dexText,
+            filteredNonFodOverlayCount = filteredOverlayCount
         )
     }
 
@@ -139,8 +153,9 @@ object DynamicProvenanceInspector {
         dumpsysOverlayList: String,
         installedPackages: List<String>,
         effectiveRoot: Boolean,
-        procLiveMaps: List<LiveProcessMapRecord>
-    ): List<OverlayDeepInspection> {
+        procLiveMaps: List<LiveProcessMapRecord>,
+        bytecodeConsumedResKeys: Set<String>
+    ): Pair<List<OverlayDeepInspection>, Int> {
         val stateMap = LinkedHashMap<String, Boolean>()
         dumpsysOverlayList.lineSequence().forEach { line ->
             val t = line.trim()
@@ -326,42 +341,81 @@ object DynamicProvenanceInspector {
             )
         }
 
-        // Probe live `cmd overlay lookup` winners with root for core FOD keys
+        // Build lookup probes starting from exact Dalvik bytecode R.id keys + fallback seeds
+        val bytecodeLookupPairs = bytecodeConsumedResKeys.mapNotNull { fullKey ->
+            val shortKey = fullKey.substringAfter(':', fullKey)
+            val type = shortKey.substringBefore('/', "")
+            val name = shortKey.substringAfter('/', "")
+            if (type.isNotBlank() && name.isNotBlank()) type to name else null
+        }
+
         val lookupResults = if (effectiveRoot) {
-            queryOverlayLookupWinners(discoveredDynamicKeys.toList())
+            queryOverlayLookupWinners((bytecodeLookupPairs + discoveredDynamicKeys).distinct())
         } else {
             emptyMap()
         }
 
-        // Compute strict content-driven fodRelevanceScore (never favoring package names without real FOD content!)
+        val bytecodeShortKeys = bytecodeLookupPairs.map { "${it.first}/${it.second}" }.toSet()
+        val hasVerificationContext = effectiveRoot || bytecodeShortKeys.isNotEmpty()
+
+        // Compute strict causal proof & filter out all generic/false-positive overlays!
         val scored = rawInspections.map { ov ->
             val matchedLookups = lookupResults.entries
                 .filter { (_, output) ->
                     output.contains(ov.packageName, ignoreCase = true) ||
                         (ov.apkPath != "UNKNOWN" && output.contains(ov.apkPath, ignoreCase = true))
                 }
-                .map { "${it.key} -> ${it.value.take(120)}" }
+                .map { "${it.key} -> ${it.value.take(140)}" }
 
-            val score = computeFodOverlayScore(
+            val matchedBytecodeKeys = ov.decodedArscEntries.mapNotNull { entry ->
+                // format: "ARSC bool/config_supportsUdfps = true"
+                val typeAndKey = entry.removePrefix("ARSC ").substringBefore(" =").trim()
+                val shortName = typeAndKey.substringAfter('/', "")
+                val matchesBytecode = typeAndKey in bytecodeShortKeys ||
+                    bytecodeConsumedResKeys.any { it.endsWith("/$shortName") }
+                if (matchesBytecode) typeAndKey else null
+            }.distinct()
+
+            val fodArscCount = ov.decodedArscEntries.count { fodKeywordsRegex.containsMatchIn(it) }
+            val fodConfigCount = ov.fodConfigEntries.count { fodKeywordsRegex.containsMatchIn(it) }
+
+            val isStrictProven = when {
+                matchedLookups.isNotEmpty() -> true
+                matchedBytecodeKeys.isNotEmpty() && (ov.isEnabled || ov.isStatic || ov.provenInLiveMaps) -> true
+                !hasVerificationContext && ov.provenInLiveMaps && (fodArscCount > 0 || fodConfigCount > 0) -> true
+                // Allow explicitly FOD/UDFPS ARSC overlays loaded in /proc/<pid>/maps if lookup didn't cover vendor-specific key names
+                ov.provenInLiveMaps && fodArscCount > 0 && ov.targetPackage in coreBiometricOverlayTargets -> true
+                else -> false
+            }
+
+            val baseScore = computeFodOverlayScore(
                 ov = ov,
                 matchedLookups = matchedLookups
             )
+            val totalScore = baseScore + (matchedBytecodeKeys.size * 55)
+
             ov.copy(
-                fodRelevanceScore = score,
-                lookupWinners = matchedLookups
+                fodRelevanceScore = totalScore,
+                lookupWinners = matchedLookups,
+                bytecodeMatchedResourceKeys = matchedBytecodeKeys,
+                isStrictProvenFod = isStrictProven
             )
         }
 
-        // Strict content-first ranking: proven FOD ARSC/XML + lookup winners + live /proc maps come FIRST
-        return scored
+        val strictlyProven = scored
+            .filter { it.isStrictProvenFod }
             .sortedWith(
                 compareByDescending<OverlayDeepInspection> { it.fodRelevanceScore }
+                    .thenByDescending { it.lookupWinners.size }
+                    .thenByDescending { it.bytecodeMatchedResourceKeys.size }
                     .thenByDescending { it.provenInLiveMaps }
                     .thenByDescending { it.isEnabled }
-                    .thenByDescending { it.priority }
                     .thenBy { it.packageName }
             )
-            .take(65)
+            .take(35)
+
+        val rejectedCount = (scored.size - strictlyProven.size).coerceAtLeast(0)
+        return strictlyProven to rejectedCount
     }
 
     internal fun computeFodOverlayScore(
@@ -374,6 +428,7 @@ object DynamicProvenanceInspector {
         val fodEntryCount = ov.fodConfigEntries.count { fodKeywordsRegex.containsMatchIn(it) }
         val hasXmlFod = ov.pseudoXmlSource.isNotBlank() && fodKeywordsRegex.containsMatchIn(ov.pseudoXmlSource)
 
+        score += minOf(ov.bytecodeMatchedResourceKeys.size * 55, 220)
         score += minOf(fodArscCount * 40, 200)
         score += minOf(fodEntryCount * 20, 80)
         if (nonFodConfigArsc > 0 && fodArscCount == 0) score += 10
@@ -381,9 +436,7 @@ object DynamicProvenanceInspector {
         if (matchedLookups.isNotEmpty()) score += 60
         if (ov.provenInLiveMaps) score += 45
 
-        // Activation & target only boost meaningfully if some real FOD/config content or live mapping exists,
-        // so unrelated enabled UI overlays (e.g. generic SystemUI theme overlays) stay clearly below real FOD RROs.
-        val hasRealFodSignal = fodArscCount > 0 || fodEntryCount > 0 || hasXmlFod || matchedLookups.isNotEmpty()
+        val hasRealFodSignal = ov.bytecodeMatchedResourceKeys.isNotEmpty() || fodArscCount > 0 || fodEntryCount > 0 || hasXmlFod || matchedLookups.isNotEmpty()
         if (hasRealFodSignal) {
             if (ov.isEnabled) score += 25
             if (ov.targetPackage in coreBiometricOverlayTargets) score += 15
@@ -398,47 +451,52 @@ object DynamicProvenanceInspector {
         discoveredKeys: List<Pair<String, String>>
     ): Map<String, String> {
         val out = LinkedHashMap<String, String>()
-        val keyCandidates = (probeResourceSeeds + discoveredKeys)
+        val keyCandidates = (discoveredKeys + probeResourceSeeds)
             .filter { (type, name) ->
                 type in setOf("bool", "integer", "string", "array", "dimen") &&
                     Regex("^[a-zA-Z0-9_]+$").matches(name) &&
-                    fodKeywordsRegex.containsMatchIn(name)
+                    (fodKeywordsRegex.containsMatchIn(name) || name.startsWith("config_"))
             }
             .distinct()
-            .take(16)
+            .take(18)
 
         if (keyCandidates.isEmpty()) return out
 
         val targets = listOf("android", "com.android.systemui")
-        val cmdLines = mutableListOf<String>()
+        val pairsToQuery = mutableListOf<Pair<String, String>>()
         for (target in targets) {
-            for ((type, name) in keyCandidates.take(8)) {
-                val fq = "$target:$type/$name"
-                cmdLines += "echo \"KEY=$target|$fq\"; cmd overlay lookup --verbose $target $fq 2>/dev/null || cmd overlay lookup $target $fq 2>/dev/null"
+            for ((type, name) in keyCandidates.take(12)) {
+                pairsToQuery += target to "$target:$type/$name"
             }
         }
-        val script = cmdLines.joinToString("; ")
-        val res = ShellExecutor.exec(script, useRoot = true, timeoutMs = 8_000L)
-        if (res.stdout.isBlank()) return out
 
-        var curKey = ""
-        val buf = StringBuilder()
-        fun flush() {
-            if (curKey.isNotBlank() && buf.isNotBlank()) {
-                out[curKey] = buf.toString().lines().take(4).joinToString(" | ").trim()
+        // Run in chunks of 12 lookups so commands never time out
+        for (chunk in pairsToQuery.chunked(12)) {
+            val script = chunk.joinToString("; ") { (target, fq) ->
+                "echo \"KEY=$target|$fq\"; cmd overlay lookup --verbose $target $fq 2>/dev/null || cmd overlay lookup $target $fq 2>/dev/null"
             }
-            buf.clear()
-        }
-        for (line in res.stdout.lineSequence()) {
-            val t = line.trim()
-            if (t.startsWith("KEY=")) {
-                flush()
-                curKey = t.removePrefix("KEY=").trim()
-            } else if (t.isNotBlank() && !t.startsWith("Error", true)) {
-                buf.appendLine(t)
+            val res = ShellExecutor.exec(script, useRoot = true, timeoutMs = 8_000L)
+            if (res.stdout.isBlank()) continue
+
+            var curKey = ""
+            val buf = StringBuilder()
+            fun flush() {
+                if (curKey.isNotBlank() && buf.isNotBlank()) {
+                    out[curKey] = buf.toString().lines().take(4).joinToString(" | ").trim()
+                }
+                buf.clear()
             }
+            for (line in res.stdout.lineSequence()) {
+                val t = line.trim()
+                if (t.startsWith("KEY=")) {
+                    flush()
+                    curKey = t.removePrefix("KEY=").trim()
+                } else if (t.isNotBlank() && !t.startsWith("Error", true)) {
+                    buf.appendLine(t)
+                }
+            }
+            flush()
         }
-        flush()
         return out
     }
 
@@ -932,11 +990,14 @@ object DynamicProvenanceInspector {
             .map { it.removePrefix("package:").trim() }
             .forEach { targetPaths += it }
 
-        // Add live /proc/<pid>/maps JAR/APK paths belonging to systemui or system_server that relate to framework/biometrics/fod
+        // Build 0x7f...... / 0x01...... ARSC ID lookup maps from framework-res.apk & SystemUI.apk first,
+        // AND discover APK, JAR, and VDEX/ODEX containers (including live-mapped /proc/<pid>/maps oat/vdex paths)!
+        val arscIdMap = HashMap<Int, ArscEntryRecord>(4096)
+
         procLiveMaps.forEach { rec ->
             (rec.mappedApks + rec.mappedJarsAndDex).forEach { mapped ->
                 val l = mapped.lowercase()
-                if ((l.endsWith(".apk") || l.endsWith(".jar")) &&
+                if ((l.endsWith(".apk") || l.endsWith(".jar") || l.endsWith(".vdex") || l.endsWith(".odex")) &&
                     (l.contains("systemui") || l.contains("services") || l.contains("framework") ||
                         l.contains("biometric") || l.contains("fingerprint") || l.contains("udfps") ||
                         l.contains("fod") || l.contains("xiaomi") || l.contains("oplus") || l.contains("treble"))
@@ -948,22 +1009,39 @@ object DynamicProvenanceInspector {
 
         if (effectiveRoot) {
             ShellExecutor.exec(
-                "ls -1 /system/framework/services.jar /system/framework/framework.jar /system/framework/miui-services.jar /system/framework/oplus-services.jar /system/framework/framework-res.apk /system_ext/priv-app/*SystemUI*/*.apk /system/priv-app/*SystemUI*/*.apk /apex/*biometric*/javalib/*.jar /apex/*biometric*/bin/* 2>/dev/null",
+                "ls -1 /system/framework/framework-res.apk /system/framework/services.jar /system/framework/framework.jar /system/framework/miui-services.jar /system/framework/oplus-services.jar /system/framework/oat/*/services.vdex /system_ext/priv-app/*SystemUI*/*.apk /system_ext/priv-app/*SystemUI*/oat/*/*.vdex /system/priv-app/*SystemUI*/*.apk /system/priv-app/*SystemUI*/oat/*/*.vdex /apex/*biometric*/javalib/*.jar /apex/*biometric*/bin/* 2>/dev/null",
                 useRoot = true,
-                timeoutMs = 4_000L
+                timeoutMs = 5_000L
             ).stdout.lines().map { it.trim() }.filter { it.startsWith("/") }.forEach { targetPaths += it }
         }
 
-        targetPaths.take(10).forEachIndexed { idx, path ->
-            val contents = mutableListOf<String>()
-            val readRes = if (path.endsWith(".apk") || path.endsWith(".jar")) {
-                ShellExecutor.readBinaryFile(path, effectiveRoot, maxBytes = 14 * 1024 * 1024)
-            } else {
-                BinaryReadResult(null, null)
-            }
+        // First pass: load resources.arsc from framework-res.apk and SystemUI.apk so bytecode 0x7f/0x01 IDs resolve accurately
+        val priorityOrderedPaths = targetPaths.sortedWith(
+            compareByDescending<String> { it.contains("framework-res.apk", true) }
+                .thenByDescending { it.contains("SystemUI.apk", true) }
+                .thenByDescending { it.endsWith(".apk") || it.endsWith(".jar") }
+        ).distinct().take(16)
 
-            if (path.endsWith(".apk") && readRes.bytes != null) {
-                val parsed = parseApkBinaryFodDetails(readRes.bytes)
+        val cachedBytes = HashMap<String, ByteArray>()
+        for (path in priorityOrderedPaths) {
+            if (!path.endsWith(".apk") && !path.endsWith(".jar") && !path.endsWith(".vdex") && !path.endsWith(".odex")) continue
+            val limitBytes = if (path.endsWith(".vdex") || path.endsWith(".jar") || path.contains("SystemUI", true)) 24 * 1024 * 1024 else 14 * 1024 * 1024
+            val readRes = ShellExecutor.readBinaryFile(path, effectiveRoot, maxBytes = limitBytes)
+            val bytes = readRes.bytes ?: continue
+            cachedBytes[path] = bytes
+            if (path.endsWith(".apk") && (path.contains("framework-res", true) || path.contains("SystemUI", true))) {
+                extractArscBytesFromApk(bytes)?.let { arscRaw ->
+                    arscIdMap.putAll(BinarySourceDecoder.buildArscIdLookupTable(arscRaw))
+                }
+            }
+        }
+
+        priorityOrderedPaths.forEachIndexed { idx, path ->
+            val contents = mutableListOf<String>()
+            val bytes = cachedBytes[path]
+
+            if (path.endsWith(".apk") && bytes != null) {
+                val parsed = parseApkBinaryFodDetails(bytes)
                 contents += parsed.decodedArscEntries.take(16)
                 contents += parsed.fodResourceStrings.take(12)
                 if (path.contains("SystemUI", true)) {
@@ -971,23 +1049,27 @@ object DynamicProvenanceInspector {
                 }
             }
 
-            if ((path.endsWith(".apk") || path.endsWith(".jar")) && readRes.bytes != null) {
+            if (bytes != null) {
                 val targetHint = when {
                     path.contains("SystemUI", true) -> "SystemUI UDFPS/HBM Controller"
-                    path.contains("services.jar", true) -> "BiometricService / FingerprintService"
+                    path.contains("services", true) -> "BiometricService / FingerprintService"
                     path.contains("framework", true) -> "Framework Resources / SensorProps"
                     path.contains("biometric", true) -> "Biometric APEX Module"
                     else -> "Runtime System Module"
                 }
-                val dexExtract = BinarySourceDecoder.extractFodDexSourcesFromArchive(
-                    archiveBytes = readRes.bytes,
-                    archivePath = path,
-                    targetHint = targetHint
-                )
+                val dexExtract = when {
+                    path.endsWith(".vdex") || path.endsWith(".odex") ->
+                        BinarySourceDecoder.extractFodDexSourcesFromVdexOrOat(bytes, path, targetHint, arscIdMap)
+                    path.endsWith(".apk") || path.endsWith(".jar") ->
+                        BinarySourceDecoder.extractFodDexSourcesFromArchive(bytes, path, targetHint, arscIdMap)
+                    else -> null
+                }
                 if (dexExtract != null) {
                     dexExtracts += dexExtract
+                    dexExtract.resolvedResourceKeys.take(10).forEach { contents += "R.id ref: $it" }
+                    dexExtract.methodTraces.take(8).forEach { contents += "Bytecode trace: ${it.fqMethod} -> ${it.invokedMethods.take(3).joinToString(",")}" }
                     dexExtract.matchedClasses.take(8).forEach { contents += "DEX class: $it" }
-                    dexExtract.matchedMethods.take(12).forEach { contents += "DEX method: $it" }
+                    dexExtract.matchedMethods.take(10).forEach { contents += "DEX method: $it" }
                     dexExtract.matchedStrings.take(8).forEach { contents += "DEX string: $it" }
                 }
             }
@@ -998,19 +1080,37 @@ object DynamicProvenanceInspector {
                 filePath = path,
                 directory = path.substringBeforeLast('/'),
                 matchedSymbolOrKey = path.substringAfterLast('/'),
-                importantContents = contents.distinct().ifEmpty { listOf("Active runtime module at $path") }.take(30)
+                importantContents = contents.distinct().ifEmpty { listOf("Active runtime module at $path") }.take(34)
             )
         }
         return out to dexExtracts
     }
 
-    fun serializeOverlayDeepInspect(list: List<OverlayDeepInspection>): String = buildString {
-        appendLine("=== DEEP CONTENT-RANKED OVERLAY INSPECTIONS (${list.size}) ===")
+    private fun extractArscBytesFromApk(apkBytes: ByteArray): ByteArray? = runCatching {
+        ZipInputStream(ByteArrayInputStream(apkBytes)).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                if (!entry.isDirectory && entry.name == "resources.arsc") {
+                    return zip.readBytes()
+                }
+                zip.closeEntry()
+                entry = zip.nextEntry
+            }
+        }
+        null
+    }.getOrNull()
+
+    fun serializeOverlayDeepInspect(
+        list: List<OverlayDeepInspection>,
+        filteredNonFodCount: Int = 0
+    ): String = buildString {
+        appendLine("=== STRICT BYTECODE & LOOKUP PROVEN OVERLAY INSPECTIONS (${list.size} proven | $filteredNonFodCount generic UI filtered) ===")
         list.forEach { ov ->
             appendLine("OVERLAY: ${ov.packageName}")
-            appendLine("  ENABLED=${ov.isEnabled} | STATIC=${ov.isStatic} | PRIORITY=${ov.priority} | TARGET=${ov.targetPackage} | SCORE=${ov.fodRelevanceScore} | LIVE_MAPPED=${ov.provenInLiveMaps}")
+            appendLine("  ENABLED=${ov.isEnabled} | STATIC=${ov.isStatic} | PRIORITY=${ov.priority} | TARGET=${ov.targetPackage} | SCORE=${ov.fodRelevanceScore} | LIVE_MAPPED=${ov.provenInLiveMaps} | STRICT_PROVEN=${ov.isStrictProvenFod}")
             appendLine("  APK_PATH=${ov.apkPath}")
             appendLine("  DIRECTORY=${ov.directory}")
+            ov.bytecodeMatchedResourceKeys.forEach { appendLine("  BYTECODE_MATCH: $it") }
             ov.lookupWinners.forEach { appendLine("  LOOKUP_WINNER: $it") }
             ov.decodedArscEntries.forEach { appendLine("  ARSC_ENTRY: $it") }
             ov.manifestSummary.forEach { appendLine("  MANIFEST: $it") }
@@ -1039,15 +1139,22 @@ object DynamicProvenanceInspector {
     }
 
     fun serializeDexSourceExtracts(list: List<DexSourceExtract>): String = buildString {
-        appendLine("=== DEX SOURCE-LEVEL FOD/UDFPS EXTRACT (${list.size}) ===")
+        appendLine("=== DEX & VDEX BYTECODE SOURCE EXTRACT (${list.size}) ===")
         list.forEach { dex ->
-            appendLine("DEX_ARCHIVE: ${dex.archivePath} (${dex.targetHint})")
+            appendLine("DEX_ARCHIVE: ${dex.archivePath} (${dex.targetHint}) [${dex.containerType}]")
+            dex.resolvedResourceKeys.forEach { appendLine("  RES_KEY: $it") }
+            dex.methodTraces.take(20).forEach { tr ->
+                appendLine("  TRACE_METHOD: ${tr.fqMethod}")
+                tr.resolvedResKeys.forEach { appendLine("    TRACE_RES: $it") }
+                tr.invokedMethods.take(10).forEach { appendLine("    TRACE_CALL: $it") }
+                tr.referencedStrings.take(6).forEach { appendLine("    TRACE_STR: $it") }
+            }
             dex.matchedClasses.forEach { appendLine("  CLASS: $it") }
             dex.matchedMethods.forEach { appendLine("  METHOD: $it") }
             dex.matchedStrings.forEach { appendLine("  STRING: $it") }
             if (dex.sourcePseudoSummary.isNotBlank()) {
                 appendLine("  SOURCE_OUTLINE_START")
-                dex.sourcePseudoSummary.lineSequence().take(65).forEach { line ->
+                dex.sourcePseudoSummary.lineSequence().take(75).forEach { line ->
                     appendLine("  CODE: $line")
                 }
                 appendLine("  SOURCE_OUTLINE_END")
@@ -1057,10 +1164,11 @@ object DynamicProvenanceInspector {
     }
 
     fun serializeProcLiveMaps(list: List<LiveProcessMapRecord>): String = buildString {
-        appendLine("=== LIVE ROOT /proc/<pid>/maps & /proc/<pid>/fd (${list.size} processes) ===")
+        appendLine("=== LIVE ROOT /proc/<pid>/maps, fd & threads (${list.size} processes) ===")
         list.forEach { rec ->
             appendLine("PROCESS: ${rec.processName} (pid=${rec.pid})")
             rec.matchedFodPaths.forEach { appendLine("  FOD_MATCH: $it") }
+            rec.activeThreads.take(25).forEach { appendLine("  THREAD: $it") }
             rec.mappedApks.forEach { appendLine("  MAPPED_APK: $it") }
             rec.mappedJarsAndDex.forEach { appendLine("  MAPPED_JAR: $it") }
             rec.mappedLibs.take(40).forEach { appendLine("  MAPPED_LIB: $it") }

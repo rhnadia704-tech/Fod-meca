@@ -139,7 +139,9 @@ data class OverlayDeepInspection(
     val provenInLiveMaps: Boolean = false,
     val lookupWinners: List<String> = emptyList(),
     val pseudoXmlSource: String = "",
-    val decodedArscEntries: List<String> = emptyList()
+    val decodedArscEntries: List<String> = emptyList(),
+    val bytecodeMatchedResourceKeys: List<String> = emptyList(),
+    val isStrictProvenFod: Boolean = false
 )
 
 @JsonClass(generateAdapter = true)
@@ -152,7 +154,18 @@ data class LiveProcessMapRecord(
     val openFds: List<String> = emptyList(),
     val matchedFodPaths: List<String> = emptyList(),
     val enrollmentNewMappedFiles: List<String> = emptyList(),
-    val enrollmentNewFds: List<String> = emptyList()
+    val enrollmentNewFds: List<String> = emptyList(),
+    val activeThreads: List<String> = emptyList()
+)
+
+@JsonClass(generateAdapter = true)
+data class DexMethodTrace(
+    val fqMethod: String,
+    val invokedMethods: List<String> = emptyList(),
+    val referencedResIds: List<Int> = emptyList(),
+    val resolvedResKeys: List<String> = emptyList(),
+    val referencedStrings: List<String> = emptyList(),
+    val bytecodeSnippet: String = ""
 )
 
 @JsonClass(generateAdapter = true)
@@ -162,7 +175,37 @@ data class DexSourceExtract(
     val matchedClasses: List<String> = emptyList(),
     val matchedMethods: List<String> = emptyList(),
     val matchedStrings: List<String> = emptyList(),
-    val sourcePseudoSummary: String = ""
+    val sourcePseudoSummary: String = "",
+    val containerType: String = "APK/JAR",
+    val methodTraces: List<DexMethodTrace> = emptyList(),
+    val referencedResIds: List<Int> = emptyList(),
+    val resolvedResourceKeys: List<String> = emptyList()
+)
+
+@JsonClass(generateAdapter = true)
+data class BinderTraceRecord(
+    val pid: Int,
+    val processName: String,
+    val incomingNodes: Int = 0,
+    val outgoingRefs: Int = 0,
+    val activeTransactions: List<String> = emptyList(),
+    val linkedPeerProcesses: List<String> = emptyList()
+)
+
+@JsonClass(generateAdapter = true)
+data class CausalChainLink(
+    val order: Int,
+    val layer: String,
+    val title: String,
+    val componentName: String,
+    val sourceFile: String,
+    val sourceDirectory: String,
+    val status: EvidenceStatus,
+    val proofKind: String,
+    val referencedResourceKeys: List<String> = emptyList(),
+    val codeExcerpt: String = "",
+    val liveRuntimeEvidence: String = "",
+    val breakExplanation: String = ""
 )
 
 @JsonClass(generateAdapter = true)
@@ -198,7 +241,8 @@ data class RawArtifactsBundle(
     val overlayDeepInspect: String = "",
     val fileProvenanceIndex: String = "",
     val procLiveMaps: String = "",
-    val dexSourceExtract: String = ""
+    val dexSourceExtract: String = "",
+    val binderTraceDelta: String = ""
 )
 
 @JsonClass(generateAdapter = true)
@@ -266,7 +310,10 @@ data class FodDiagnosticReport(
     val overlayInspections: List<OverlayDeepInspection> = emptyList(),
     val fileProvenance: List<FileProvenanceArtifact> = emptyList(),
     val procLiveMaps: List<LiveProcessMapRecord> = emptyList(),
-    val dexSourceExtracts: List<DexSourceExtract> = emptyList()
+    val dexSourceExtracts: List<DexSourceExtract> = emptyList(),
+    val causalChain: List<CausalChainLink> = emptyList(),
+    val binderTraces: List<BinderTraceRecord> = emptyList(),
+    val filteredNonFodOverlayCount: Int = 0
 )
 
 @JsonClass(generateAdapter = true)

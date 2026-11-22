@@ -1,5 +1,6 @@
 package com.example.engine
 
+import com.example.model.DexMethodTrace
 import com.example.model.DexSourceExtract
 import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
@@ -10,7 +11,8 @@ data class ArscEntryRecord(
     val typeName: String,
     val keyName: String,
     val valueText: String,
-    val packageName: String = ""
+    val packageName: String = "",
+    val resId: Int = 0
 )
 
 data class DecodedArscResult(
@@ -224,7 +226,21 @@ object BinarySourceDecoder {
     // 3. resources.arsc (RES_TABLE_TYPE = 0x0002) -> Resource Key/Value Decoder
     // -------------------------------------------------------------------------
 
-    fun decodeArscResourceEntries(bytes: ByteArray, maxFodEntries: Int = 120): DecodedArscResult {
+    fun buildArscIdLookupTable(bytes: ByteArray): Map<Int, ArscEntryRecord> {
+        val map = HashMap<Int, ArscEntryRecord>(2048)
+        decodeArscInternal(bytes, maxFodEntries = 1, onlyFodFilter = false, outIdMap = map)
+        return map
+    }
+
+    fun decodeArscResourceEntries(bytes: ByteArray, maxFodEntries: Int = 120): DecodedArscResult =
+        decodeArscInternal(bytes, maxFodEntries = maxFodEntries, onlyFodFilter = true, outIdMap = null)
+
+    private fun decodeArscInternal(
+        bytes: ByteArray,
+        maxFodEntries: Int,
+        onlyFodFilter: Boolean,
+        outIdMap: MutableMap<Int, ArscEntryRecord>?
+    ): DecodedArscResult {
         if (bytes.size < 16) {
             return DecodedArscResult(emptyList(), emptyList(), emptyList(), 0)
         }
@@ -255,10 +271,12 @@ object BinarySourceDecoder {
                 }
                 0x0200 -> { // RES_TABLE_PACKAGE_TYPE
                     val pkgEnd = pos + chunkSize
+                    val pkgId = if (pos + 12 <= pkgEnd) buf.getInt(pos + 8) and 0xFF else 0x7F
                     val pkgName = if (pos + 268 <= pkgEnd) readFixedUtf16CString(bytes, pos + 12, 128) else ""
                     if (pkgName.isNotBlank()) packageNames += pkgName
                     val typeStringsRel = if (pos + 272 <= pkgEnd) buf.getInt(pos + 268) else 0
                     val keyStringsRel = if (pos + 280 <= pkgEnd) buf.getInt(pos + 276) else 0
+                    val typeIdOffset = if (headerSize >= 288 && pos + 288 <= pkgEnd) buf.getInt(pos + 284) else 0
 
                     val typePool = if (typeStringsRel in headerSize until chunkSize) {
                         parseStringPool(bytes, pos + typeStringsRel, pkgEnd)
@@ -268,7 +286,7 @@ object BinarySourceDecoder {
                     } else emptyList()
 
                     var cPos = pos + headerSize
-                    while (cPos + 8 <= pkgEnd && results.size < maxFodEntries * 2) {
+                    while (cPos + 8 <= pkgEnd && (!onlyFodFilter || results.size < maxFodEntries * 2)) {
                         val cType = buf.getShort(cPos).toInt() and 0xFFFF
                         val cHeader = buf.getShort(cPos + 2).toInt() and 0xFFFF
                         val cSize = buf.getInt(cPos + 4)
@@ -276,20 +294,22 @@ object BinarySourceDecoder {
 
                         if (cType == 0x0201 && cPos + 20 <= pkgEnd) { // RES_TABLE_TYPE_TYPE
                             val cEnd = cPos + cSize
-                            val typeId = bytes[cPos + 8].toInt() and 0xFF
+                            val typeId = (bytes[cPos + 8].toInt() and 0xFF) + typeIdOffset
                             val typeFlags = bytes[cPos + 9].toInt() and 0xFF
                             val entryCount = buf.getInt(cPos + 12)
                             val entriesStart = buf.getInt(cPos + 16)
-                            val typeName = typePool.getOrNull(typeId - 1) ?: "type_$typeId"
+                            val typeName = typePool.getOrNull((bytes[cPos + 8].toInt() and 0xFF) - 1) ?: "type_$typeId"
                             val entriesBase = cPos + entriesStart
                             val offsetsBase = cPos + cHeader
                             val isSparse = (typeFlags and 0x01) != 0
 
                             if (entryCount in 1..20_000 && entriesBase in cPos until cEnd) {
                                 for (i in 0 until entryCount) {
+                                    var actualEntryId = i
                                     val entryOffset = if (isSparse) {
                                         val offPos = offsetsBase + i * 4
                                         if (offPos + 4 > cEnd) break
+                                        actualEntryId = buf.getShort(offPos).toInt() and 0xFFFF
                                         val offDiv4 = buf.getShort(offPos + 2).toInt() and 0xFFFF
                                         if (offDiv4 == 0xFFFF) -1 else offDiv4 * 4
                                     } else {
@@ -328,7 +348,6 @@ object BinarySourceDecoder {
                                             val valData = buf.getInt(valPos + 4)
                                             decodedValue = formatResValue(valType, valData, globalPool)
                                         } else {
-                                            val mapCountPos = ePos + entrySize
                                             if (ePos + 16 > cEnd) continue
                                             val mapCount = buf.getInt(ePos + 12).coerceIn(0, 32)
                                             val items = ArrayList<String>(mapCount)
@@ -344,17 +363,24 @@ object BinarySourceDecoder {
                                         }
                                     }
 
-                                    val isFodRelevant = fodKeywordRegex.containsMatchIn(keyName) ||
-                                        fodKeywordRegex.containsMatchIn(decodedValue) ||
-                                        keyName.startsWith("config_")
-                                    if (isFodRelevant) {
-                                        discoveredKeys += typeName to keyName
-                                        results += ArscEntryRecord(
-                                            typeName = typeName,
-                                            keyName = keyName,
-                                            valueText = decodedValue,
-                                            packageName = pkgName
-                                        )
+                                    val resId = (pkgId shl 24) or ((typeId and 0xFF) shl 16) or (actualEntryId and 0xFFFF)
+                                    val rec = ArscEntryRecord(
+                                        typeName = typeName,
+                                        keyName = keyName,
+                                        valueText = decodedValue,
+                                        packageName = pkgName,
+                                        resId = resId
+                                    )
+                                    outIdMap?.putIfAbsent(resId, rec)
+
+                                    if (onlyFodFilter) {
+                                        val isFodRelevant = fodKeywordRegex.containsMatchIn(keyName) ||
+                                            fodKeywordRegex.containsMatchIn(decodedValue) ||
+                                            keyName.startsWith("config_")
+                                        if (isFodRelevant) {
+                                            discoveredKeys += typeName to keyName
+                                            results += rec
+                                        }
                                     }
                                 }
                             }
@@ -427,19 +453,23 @@ object BinarySourceDecoder {
     }
 
     // -------------------------------------------------------------------------
-    // 4. Multi-DEX (classes*.dex, DEX 035-041) Source-Level Extractor
+    // 4. Multi-DEX (APK/JAR classes*.dex + VDEX/ODEX) Source & Bytecode Extractor
     // -------------------------------------------------------------------------
 
     fun extractFodDexSourcesFromArchive(
         archiveBytes: ByteArray,
         archivePath: String,
-        targetHint: String
+        targetHint: String,
+        arscIdMap: Map<Int, ArscEntryRecord> = emptyMap()
     ): DexSourceExtract? {
         val matchedClasses = linkedSetOf<String>()
         val matchedMethods = linkedSetOf<String>()
         val matchedStrings = linkedSetOf<String>()
         val classBodyOutlines = linkedMapOf<String, MutableList<String>>()
         val classHeaders = linkedMapOf<String, String>()
+        val methodTraces = mutableListOf<DexMethodTrace>()
+        val referencedResIds = linkedSetOf<Int>()
+        val resolvedResKeys = linkedSetOf<String>()
 
         runCatching {
             ZipInputStream(ByteArrayInputStream(archiveBytes)).use { zip ->
@@ -448,13 +478,17 @@ object BinarySourceDecoder {
                     val name = entry.name
                     if (!entry.isDirectory && name.startsWith("classes") && name.endsWith(".dex")) {
                         val dexBytes = zip.readBytes()
-                        parseSingleDexFodContent(
+                        DalvikBytecodeDecoder.parseSingleDexWithBytecode(
                             dexBytes = dexBytes,
+                            arscIdMap = arscIdMap,
                             matchedClasses = matchedClasses,
                             matchedMethods = matchedMethods,
                             matchedStrings = matchedStrings,
                             classHeaders = classHeaders,
-                            classBodyOutlines = classBodyOutlines
+                            classBodyOutlines = classBodyOutlines,
+                            methodTraces = methodTraces,
+                            referencedResIds = referencedResIds,
+                            resolvedResourceKeys = resolvedResKeys
                         )
                     }
                     zip.closeEntry()
@@ -463,22 +497,115 @@ object BinarySourceDecoder {
             }
         }
 
-        if (matchedClasses.isEmpty() && matchedMethods.isEmpty() && matchedStrings.isEmpty()) {
+        return finalizeDexSourceExtract(
+            archivePath = archivePath,
+            targetHint = targetHint,
+            containerType = "APK/JAR",
+            matchedClasses = matchedClasses,
+            matchedMethods = matchedMethods,
+            matchedStrings = matchedStrings,
+            classHeaders = classHeaders,
+            classBodyOutlines = classBodyOutlines,
+            methodTraces = methodTraces,
+            referencedResIds = referencedResIds,
+            resolvedResKeys = resolvedResKeys
+        )
+    }
+
+    fun extractFodDexSourcesFromVdexOrOat(
+        containerBytes: ByteArray,
+        containerPath: String,
+        targetHint: String,
+        arscIdMap: Map<Int, ArscEntryRecord> = emptyMap()
+    ): DexSourceExtract? {
+        val dexSlices = DalvikBytecodeDecoder.extractStandardDexSlicesFromVdexOrOat(containerBytes)
+        if (dexSlices.isEmpty()) return null
+
+        val matchedClasses = linkedSetOf<String>()
+        val matchedMethods = linkedSetOf<String>()
+        val matchedStrings = linkedSetOf<String>()
+        val classBodyOutlines = linkedMapOf<String, MutableList<String>>()
+        val classHeaders = linkedMapOf<String, String>()
+        val methodTraces = mutableListOf<DexMethodTrace>()
+        val referencedResIds = linkedSetOf<Int>()
+        val resolvedResKeys = linkedSetOf<String>()
+
+        dexSlices.forEach { slice ->
+            DalvikBytecodeDecoder.parseSingleDexWithBytecode(
+                dexBytes = slice,
+                arscIdMap = arscIdMap,
+                matchedClasses = matchedClasses,
+                matchedMethods = matchedMethods,
+                matchedStrings = matchedStrings,
+                classHeaders = classHeaders,
+                classBodyOutlines = classBodyOutlines,
+                methodTraces = methodTraces,
+                referencedResIds = referencedResIds,
+                resolvedResourceKeys = resolvedResKeys
+            )
+        }
+
+        return finalizeDexSourceExtract(
+            archivePath = containerPath,
+            targetHint = targetHint,
+            containerType = "VDEX/ODEX (${dexSlices.size} DEX)",
+            matchedClasses = matchedClasses,
+            matchedMethods = matchedMethods,
+            matchedStrings = matchedStrings,
+            classHeaders = classHeaders,
+            classBodyOutlines = classBodyOutlines,
+            methodTraces = methodTraces,
+            referencedResIds = referencedResIds,
+            resolvedResKeys = resolvedResKeys
+        )
+    }
+
+    private fun finalizeDexSourceExtract(
+        archivePath: String,
+        targetHint: String,
+        containerType: String,
+        matchedClasses: Set<String>,
+        matchedMethods: Set<String>,
+        matchedStrings: Set<String>,
+        classHeaders: Map<String, String>,
+        classBodyOutlines: Map<String, List<String>>,
+        methodTraces: List<DexMethodTrace>,
+        referencedResIds: Set<Int>,
+        resolvedResKeys: Set<String>
+    ): DexSourceExtract? {
+        if (matchedClasses.isEmpty() && matchedMethods.isEmpty() && matchedStrings.isEmpty() && methodTraces.isEmpty()) {
             return null
         }
 
+        val prioritizedTraces = methodTraces
+            .distinctBy { it.fqMethod }
+            .sortedByDescending { (it.resolvedResKeys.size * 4) + (it.referencedStrings.size * 3) + it.invokedMethods.size }
+            .take(30)
+
         val pseudoSummary = buildString {
-            appendLine("// Extracted DEX FOD/UDFPS Source Outline from $archivePath")
-            classHeaders.entries.take(28).forEach { (cls, hdr) ->
+            appendLine("// [$containerType] Extracted Dalvik Bytecode & Call Graph from $archivePath")
+            if (resolvedResKeys.isNotEmpty()) {
+                appendLine("// Exact R.id Resource Keys Referenced in Bytecode:")
+                resolvedResKeys.take(20).forEach { k -> appendLine("//   R -> $k") }
+            }
+            if (prioritizedTraces.isNotEmpty()) {
+                appendLine("// Decoded Dalvik Bytecode Call Graph (code_item):")
+                prioritizedTraces.take(14).forEach { tr ->
+                    if (tr.bytecodeSnippet.isNotBlank()) {
+                        appendLine(tr.bytecodeSnippet)
+                    }
+                }
+            }
+            classHeaders.entries.take(20).forEach { (cls, hdr) ->
                 appendLine("$hdr {")
-                classBodyOutlines[cls].orEmpty().take(12).forEach { m ->
+                classBodyOutlines[cls].orEmpty().take(10).forEach { m ->
                     appendLine("    $m")
                 }
                 appendLine("}")
             }
             if (matchedStrings.isNotEmpty()) {
                 appendLine("// Key SYSFS / PROP / AIDL / HIDL Strings Referenced:")
-                matchedStrings.take(30).forEach { s -> appendLine("//   \"$s\"") }
+                matchedStrings.take(24).forEach { s -> appendLine("//   \"$s\"") }
             }
         }.trim()
 
@@ -488,7 +615,11 @@ object BinarySourceDecoder {
             matchedClasses = matchedClasses.take(60),
             matchedMethods = matchedMethods.take(120),
             matchedStrings = matchedStrings.take(80),
-            sourcePseudoSummary = pseudoSummary
+            sourcePseudoSummary = pseudoSummary,
+            containerType = containerType,
+            methodTraces = prioritizedTraces,
+            referencedResIds = referencedResIds.take(40),
+            resolvedResourceKeys = resolvedResKeys.take(50)
         )
     }
 
@@ -500,196 +631,16 @@ object BinarySourceDecoder {
         classHeaders: MutableMap<String, String> = linkedMapOf(),
         classBodyOutlines: MutableMap<String, MutableList<String>> = linkedMapOf()
     ) {
-        if (dexBytes.size < 112) return
-        if (dexBytes[0] != 'd'.code.toByte() || dexBytes[1] != 'e'.code.toByte() ||
-            dexBytes[2] != 'x'.code.toByte() || dexBytes[3] != '\n'.code.toByte()
-        ) return
-
-        val buf = ByteBuffer.wrap(dexBytes).order(ByteOrder.LITTLE_ENDIAN)
-        val stringIdsSize = buf.getInt(56)
-        val stringIdsOff = buf.getInt(60)
-        val typeIdsSize = buf.getInt(64)
-        val typeIdsOff = buf.getInt(68)
-        val protoIdsSize = buf.getInt(72)
-        val protoIdsOff = buf.getInt(76)
-        val methodIdsSize = buf.getInt(88)
-        val methodIdsOff = buf.getInt(92)
-        val classDefsSize = buf.getInt(96)
-        val classDefsOff = buf.getInt(100)
-
-        if (stringIdsSize !in 1..250_000 || stringIdsOff < 112 || stringIdsOff + stringIdsSize * 4 > dexBytes.size) return
-        if (typeIdsSize !in 0..100_000 || typeIdsOff + typeIdsSize * 4 > dexBytes.size) return
-
-        val stringCache = HashMap<Int, String>(4096)
-        fun getString(idx: Int): String {
-            if (idx !in 0 until stringIdsSize) return ""
-            return stringCache.getOrPut(idx) {
-                val dataOff = buf.getInt(stringIdsOff + idx * 4)
-                decodeDexMutf8(dexBytes, dataOff)
-            }
-        }
-
-        fun getTypeName(typeIdx: Int): String {
-            if (typeIdx !in 0 until typeIdsSize) return ""
-            val strIdx = buf.getInt(typeIdsOff + typeIdx * 4)
-            return formatDexDescriptor(getString(strIdx))
-        }
-
-        // 1. Scan class_defs for FOD/UDFPS/Biometric/HBM classes
-        val relevantTypeIndices = HashSet<Int>()
-        if (classDefsSize > 0 && classDefsOff > 0 && classDefsOff + classDefsSize * 32 <= dexBytes.size) {
-            for (i in 0 until classDefsSize) {
-                val cOff = classDefsOff + i * 32
-                val classTypeIdx = buf.getInt(cOff)
-                val className = getTypeName(classTypeIdx)
-                if (fodDexMethodOrClassRegex.containsMatchIn(className)) {
-                    relevantTypeIndices += classTypeIdx
-                    val superIdx = buf.getInt(cOff + 8)
-                    val superName = if (superIdx != -1) getTypeName(superIdx) else ""
-                    val ifacesOff = buf.getInt(cOff + 12)
-                    val ifaces = readDexTypeList(dexBytes, buf, ifacesOff, ::getTypeName)
-
-                    val header = buildString {
-                        append("class ").append(className)
-                        if (superName.isNotBlank() && superName != "java.lang.Object") {
-                            append(" : ").append(superName)
-                        }
-                        if (ifaces.isNotEmpty()) {
-                            append(if (superName.isNotBlank() && superName != "java.lang.Object") ", " else " : ")
-                            append(ifaces.joinToString(", "))
-                        }
-                    }
-                    matchedClasses += className
-                    classHeaders[className] = header
-                }
-            }
-        }
-
-        // 2. Scan method_ids referencing FOD classes OR FOD-specific method names
-        if (methodIdsSize > 0 && methodIdsOff > 0 && methodIdsOff + methodIdsSize * 8 <= dexBytes.size) {
-            for (i in 0 until methodIdsSize) {
-                val mOff = methodIdsOff + i * 8
-                val classIdx = buf.getShort(mOff).toInt() and 0xFFFF
-                val protoIdx = buf.getShort(mOff + 2).toInt() and 0xFFFF
-                val nameIdx = buf.getInt(mOff + 4)
-
-                val methodName = getString(nameIdx)
-                val inMatchedClass = classIdx in relevantTypeIndices
-                val isInterestingMethodName = fodDexMethodOrClassRegex.containsMatchIn(methodName)
-                if (!inMatchedClass && !isInterestingMethodName) continue
-
-                val ownerClass = getTypeName(classIdx)
-                if (!inMatchedClass && !fodDexMethodOrClassRegex.containsMatchIn(ownerClass) && methodName.length < 4) continue
-
-                val sig = buildMethodSignature(
-                    dexBytes = dexBytes,
-                    buf = buf,
-                    protoIdsOff = protoIdsOff,
-                    protoIdsSize = protoIdsSize,
-                    protoIdx = protoIdx,
-                    methodName = methodName,
-                    getTypeName = ::getTypeName
-                )
-                val fqMethod = "$ownerClass.$sig"
-                if (matchedMethods.size < 160) matchedMethods += fqMethod
-                if (inMatchedClass) {
-                    classBodyOutlines.getOrPut(ownerClass) { mutableListOf() }.add(sig)
-                }
-            }
-        }
-
-        // 3. Scan FOD/sysfs/prop/Binder/HIDL strings across string pool
-        for (idx in 0 until stringIdsSize) {
-            val s = getString(idx)
-            if (s.length !in 4..180) continue
-            val isSysfsOrDev = s.startsWith("/sys/") || s.startsWith("/dev/") || s.startsWith("/vendor/")
-            val isProp = s.startsWith("persist.sys.phh") || s.startsWith("persist.sys.fod") ||
-                s.startsWith("ro.vendor.fingerprint") || s.startsWith("ro.hardware.fp")
-            val isHalDescriptor = (s.contains("hardware.biometrics.fingerprint") ||
-                s.contains("vendor.xiaomi.hardware") ||
-                s.contains("vendor.oplus.hardware") ||
-                s.contains("vendor.goodix.hardware")) && !s.startsWith("L")
-            val isKeyHook = s.contains("disp_param", true) || s.contains("fod_status", true) ||
-                s.contains("extCmd", false) || s.contains("udfps_hbm", true)
-
-            if (isSysfsOrDev || isProp || isHalDescriptor || isKeyHook) {
-                matchedStrings += s
-                if (matchedStrings.size >= 100) break
-            }
-        }
+        DalvikBytecodeDecoder.parseSingleDexWithBytecode(
+            dexBytes = dexBytes,
+            arscIdMap = emptyMap(),
+            matchedClasses = matchedClasses,
+            matchedMethods = matchedMethods,
+            matchedStrings = matchedStrings,
+            classHeaders = classHeaders,
+            classBodyOutlines = classBodyOutlines
+        )
     }
 
-    private fun readDexTypeList(
-        dexBytes: ByteArray,
-        buf: ByteBuffer,
-        offset: Int,
-        getTypeName: (Int) -> String
-    ): List<String> {
-        if (offset <= 0 || offset + 4 > dexBytes.size) return emptyList()
-        val size = buf.getInt(offset)
-        if (size !in 1..64 || offset + 4 + size * 2 > dexBytes.size) return emptyList()
-        return (0 until size).mapNotNull { i ->
-            val tIdx = buf.getShort(offset + 4 + i * 2).toInt() and 0xFFFF
-            getTypeName(tIdx).takeIf { it.isNotBlank() }
-        }
-    }
-
-    private fun buildMethodSignature(
-        dexBytes: ByteArray,
-        buf: ByteBuffer,
-        protoIdsOff: Int,
-        protoIdsSize: Int,
-        protoIdx: Int,
-        methodName: String,
-        getTypeName: (Int) -> String
-    ): String {
-        if (protoIdx !in 0 until protoIdsSize || protoIdsOff <= 0 || protoIdsOff + protoIdx * 12 + 12 > dexBytes.size) {
-            return "fun $methodName()"
-        }
-        val pOff = protoIdsOff + protoIdx * 12
-        val returnTypeIdx = buf.getInt(pOff + 4)
-        val paramsOff = buf.getInt(pOff + 8)
-        val retType = getTypeName(returnTypeIdx).substringAfterLast('.')
-        val params = readDexTypeList(dexBytes, buf, paramsOff, getTypeName)
-            .map { it.substringAfterLast('.') }
-        return "fun $methodName(${params.joinToString(", ")}): $retType"
-    }
-
-    private fun decodeDexMutf8(bytes: ByteArray, dataOff: Int): String {
-        if (dataOff !in 112 until bytes.size) return ""
-        var p = dataOff
-        // Skip ULEB128 utf16_size (max 5 bytes)
-        var shift = 0
-        while (p < bytes.size && shift < 35) {
-            val b = bytes[p++].toInt() and 0xFF
-            if ((b and 0x80) == 0) break
-            shift += 7
-        }
-        val start = p
-        while (p < bytes.size && bytes[p] != 0.toByte() && (p - start) < 512) {
-            p++
-        }
-        val len = p - start
-        if (len <= 0 || start + len > bytes.size) return ""
-        return String(bytes, start, len, Charsets.UTF_8)
-    }
-
-    internal fun formatDexDescriptor(desc: String): String {
-        if (desc.isEmpty()) return ""
-        return when {
-            desc.startsWith("L") && desc.endsWith(";") ->
-                desc.substring(1, desc.length - 1).replace('/', '.')
-            desc.startsWith("[") -> formatDexDescriptor(desc.substring(1)) + "[]"
-            desc == "V" -> "void"
-            desc == "Z" -> "boolean"
-            desc == "B" -> "byte"
-            desc == "S" -> "short"
-            desc == "C" -> "char"
-            desc == "I" -> "int"
-            desc == "J" -> "long"
-            desc == "F" -> "float"
-            desc == "D" -> "double"
-            else -> desc
-        }
-    }
+    internal fun formatDexDescriptor(desc: String): String = DalvikBytecodeDecoder.formatDexDescriptor(desc)
 }

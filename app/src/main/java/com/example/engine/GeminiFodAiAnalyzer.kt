@@ -648,7 +648,15 @@ class GeminiFodAiAnalyzer(private val context: Context) {
             6. Label statements with [FACT], [CORRELATION], or [DEDUCTION]. Zero hallucination.
 
             VERDICT PRELIMINARY: ${portResult.factualRootCauseVerdict}
+            CAUSAL BREAK SUMMARY: ${portResult.causalBreakSummary}
+            NON-FOD OVERLAYS FILTERED OUT: ${portResult.filteredNonFodOverlayCount}
             BOOT/VENDOR PARITY: ${portResult.bootVendorParityVerified} -> ${portResult.bootVendorParitySummary}
+
+            END-TO-END CAUSAL CHAIN (ROM vs GSI):
+            ${portResult.romCausalChain.mapIndexed { idx, r ->
+                val g = portResult.gsiCausalChain.getOrNull(idx)
+                "- [${r.order}] ${r.layer}: ROM=${r.status}(${r.proofKind}, file=${r.sourceFile}) vs GSI=${g?.status ?: "UNKNOWN"}(${g?.breakExplanation.orEmpty()})"
+            }.joinToString("\n")}
 
             EXACT FILES & MECHANISMS TO EXTRACT FROM CUSTOM ROM (${portResult.extractableFiles.size}):
             $extractablesDump
@@ -691,6 +699,17 @@ class GeminiFodAiAnalyzer(private val context: Context) {
             appendLine("- ROM ZIP: `${romZip.sourceName}` (${romZip.totalFiles} fichiers, ${romZip.totalBytes / 1024} Ko)")
             appendLine("- GSI ZIP: `${gsiZip.sourceName}` (${gsiZip.totalFiles} fichiers, ${gsiZip.totalBytes / 1024} Ko)")
             appendLine("- Boot/Vendor Parity: `${portResult.bootVendorParityVerified}` — ${portResult.bootVendorParitySummary}")
+            if (portResult.causalBreakSummary.isNotBlank()) {
+                appendLine("- **Causal Break**: ${portResult.causalBreakSummary} (${portResult.filteredNonFodOverlayCount} overlays non-FOD écartés)")
+            }
+            if (portResult.romCausalChain.isNotEmpty()) {
+                appendLine()
+                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Chaîne causale de bout en bout (ROM vs GSI)" else "End-to-End Causal Chain (ROM vs GSI)"}")
+                portResult.romCausalChain.forEachIndexed { idx, r ->
+                    val g = portResult.gsiCausalChain.getOrNull(idx)
+                    appendLine("  ${r.order}. **${r.title}**: ROM=`${r.status}` (`${r.sourceFile}`) vs GSI=`${g?.status ?: "UNKNOWN"}` ${g?.breakExplanation?.takeIf { it.isNotBlank() }?.let { "→ $it" }.orEmpty()}")
+                }
+            }
             appendLine()
             appendLine("### [FACT] ${if (language == AppLanguage.FR) "Causes réelles détectées dans les fichiers bruts (${failedDiffs.size} critiques)" else "Actual Root Causes Found in Raw Files (${failedDiffs.size} critical)"}")
             if (failedDiffs.isEmpty() && otherDiffs.isEmpty()) {
@@ -788,19 +807,38 @@ class GeminiFodAiAnalyzer(private val context: Context) {
                     appendLine("  - `${rec.processName}` (pid=${rec.pid}): matchedFod=${rec.matchedFodPaths.take(4)} | newMaps=${rec.enrollmentNewMappedFiles.size} | newFds=${rec.enrollmentNewFds.size}")
                 }
             }
-            if (report.dexSourceExtracts.isNotEmpty()) {
+            if (report.causalChain.isNotEmpty()) {
                 appendLine()
-                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Code source DEX extrait (Classes & Méthodes)" else "Extracted DEX Source (Classes & Methods)"}")
-                report.dexSourceExtracts.take(6).forEach { dex ->
-                    appendLine("  - `${dex.archivePath}` (${dex.targetHint}): ${dex.matchedClasses.size} classes, ${dex.matchedMethods.size} methods → ${dex.matchedClasses.take(4).joinToString(", ")}")
+                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Chaîne causale inversée (${report.causalChain.size} couches · ${report.filteredNonFodOverlayCount} RRO génériques écartés)" else "Causal Reverse-Engineering Chain (${report.causalChain.size} layers · ${report.filteredNonFodOverlayCount} generic RROs filtered)"}")
+                report.causalChain.forEach { link ->
+                    appendLine("  ${link.order}. [${link.status}] ${link.title} (${link.proofKind}) · `${link.sourceFile}`")
+                    if (link.referencedResourceKeys.isNotEmpty()) appendLine("     Keys: ${link.referencedResourceKeys.take(6).joinToString(", ")}")
+                    if (link.breakExplanation.isNotBlank()) appendLine("     Break: ${link.breakExplanation}")
                 }
             }
-            val topRros = report.overlayInspections.filter { it.fodRelevanceScore >= 30 || it.lookupWinners.isNotEmpty() }
+            if (report.dexSourceExtracts.isNotEmpty()) {
+                appendLine()
+                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Code source DEX & Bytecode extrait" else "Extracted DEX Source & Bytecode"}")
+                report.dexSourceExtracts.take(6).forEach { dex ->
+                    appendLine("  - `${dex.archivePath}` (${dex.targetHint}) [${dex.containerType}]: ${dex.matchedClasses.size} classes, ${dex.matchedMethods.size} methods, res=${dex.resolvedResourceKeys.take(4).joinToString(",")}")
+                    dex.methodTraces.take(3).forEach { tr ->
+                        appendLine("    - ${tr.fqMethod} -> ${tr.invokedMethods.take(4).joinToString(", ")} [res=${tr.resolvedResKeys.joinToString(",")}]")
+                    }
+                }
+            }
+            if (report.binderTraces.isNotEmpty()) {
+                appendLine()
+                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Transactions Binder IPC & HAL" else "Binder IPC & HAL Links"}")
+                report.binderTraces.take(6).forEach { bt ->
+                    appendLine("  - `${bt.processName}` (pid=${bt.pid}): peers=${bt.linkedPeerProcesses.take(4).joinToString(", ")} | tx=${bt.activeTransactions.take(4).joinToString(", ")}")
+                }
+            }
+            val topRros = report.overlayInspections.filter { it.isStrictProvenFod || it.fodRelevanceScore >= 30 || it.lookupWinners.isNotEmpty() }
             if (topRros.isNotEmpty()) {
                 appendLine()
-                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Overlays RRO FOD prouvés par contenu ARSC/Lookup" else "Content-Proven FOD RRO Overlays"}")
+                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Overlays RRO FOD prouvés (0 faux positif)" else "Strict Proven FOD RRO Overlays (0 False Positives)"}")
                 topRros.take(8).forEach { ov ->
-                    appendLine("  - `${ov.packageName}` (score=${ov.fodRelevanceScore}, live=${ov.provenInLiveMaps}, apk=`${ov.apkPath}`): ${(ov.lookupWinners + ov.decodedArscEntries).take(4).joinToString(" ; ")}")
+                    appendLine("  - `${ov.packageName}` (strict=${ov.isStrictProvenFod}, score=${ov.fodRelevanceScore}, live=${ov.provenInLiveMaps}, apk=`${ov.apkPath}`): ${(ov.bytecodeMatchedResourceKeys + ov.lookupWinners + ov.decodedArscEntries).take(4).joinToString(" ; ")}")
                 }
             }
             if (report.patches.isNotEmpty()) {
@@ -929,13 +967,19 @@ class GeminiFodAiAnalyzer(private val context: Context) {
             ELF & DISASSEMBLY (${report.elfAnalyses.size}):
             $elfDump
 
-            DEEP OVERLAY INSPECTIONS (${report.overlayInspections.size}):
+            END-TO-END CAUSAL CHAIN (${report.causalChain.size} layers | ${report.filteredNonFodOverlayCount} non-FOD RROs filtered):
+            ${report.causalChain.joinToString("\n") { "- [${it.status}] ${it.title} (${it.proofKind}) file=${it.sourceFile} keys=${it.referencedResourceKeys.take(5)} break=${it.breakExplanation}" }}
+
+            DEEP OVERLAY INSPECTIONS (${report.overlayInspections.size} strict proven):
             ${report.rawArtifacts.overlayDeepInspect.take(5500)}
 
-            LIVE /proc/<pid>/maps & fd (${report.procLiveMaps.size} processes):
+            LIVE /proc/<pid>/maps, fd & threads (${report.procLiveMaps.size} processes):
             ${report.rawArtifacts.procLiveMaps.take(4500)}
 
-            DEX SOURCE-LEVEL EXTRACTS (${report.dexSourceExtracts.size} archives):
+            BINDER IPC & HAL TRANSACTIONS (${report.binderTraces.size} processes):
+            ${report.rawArtifacts.binderTraceDelta.take(3500)}
+
+            DEX SOURCE-LEVEL & BYTECODE EXTRACTS (${report.dexSourceExtracts.size} archives):
             ${report.rawArtifacts.dexSourceExtract.take(4500)}
 
             DYNAMIC FILE PROVENANCE INDEX (${report.fileProvenance.size}):

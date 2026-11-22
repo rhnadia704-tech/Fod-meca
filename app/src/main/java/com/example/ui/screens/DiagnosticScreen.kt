@@ -91,6 +91,7 @@ import com.example.i18n.LocalAppStrings
 import com.example.model.DiagnosticMode
 import com.example.model.EvidenceStatus
 import com.example.model.FodDiagnosticReport
+import com.example.ui.components.CausalChainSection
 import com.example.ui.components.InteractiveDependencyGraph
 import com.example.ui.components.KnowledgeBadge
 import com.example.ui.components.StatusPill
@@ -466,6 +467,16 @@ fun DiagnosticScreen(
 
             when (activeSubTab) {
                 0 -> { // SESSION FLOW
+                    if (report.causalChain.isNotEmpty()) {
+                        item {
+                            CausalChainSection(
+                                links = report.causalChain,
+                                title = strings.causalChainTitle,
+                                filteredOverlayCount = report.filteredNonFodOverlayCount,
+                                onCopyPath = { copyPathToClipboard(context, it) }
+                            )
+                        }
+                    }
                     if (report.fingerDownChain.isNotEmpty()) {
                         item {
                             TelemetrySectionCard(borderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)) {
@@ -654,18 +665,26 @@ fun DiagnosticScreen(
                         }
                     }
 
-                    // Deep Overlay & Dynamic File Provenance Section
-                    if (report.overlayInspections.isNotEmpty() || report.fileProvenance.isNotEmpty()) {
+                    // Strict Proven FOD RRO & Dynamic File Provenance Section (0 false positives)
+                    if (report.overlayInspections.isNotEmpty() || report.fileProvenance.isNotEmpty() || report.filteredNonFodOverlayCount > 0) {
                         item {
-                            Text(
-                                text = "${strings.provenanceDiagnosticTitle} (${report.overlayInspections.size} RRO · ${report.fileProvenance.size} files)",
-                                style = MaterialTheme.typography.titleMedium,
-                                modifier = Modifier.padding(top = 8.dp)
-                            )
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(top = 8.dp)) {
+                                Text(
+                                    text = "${strings.strictRroTitle} (${report.overlayInspections.size} RRO · ${report.fileProvenance.size} files)",
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                                if (report.filteredNonFodOverlayCount > 0) {
+                                    Text(
+                                        text = "${report.filteredNonFodOverlayCount} ${strings.filteredOverlaysNotice}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = LocalFodStatusColors.current.confirmed
+                                    )
+                                }
+                            }
                         }
                         items(report.overlayInspections, key = { "ov_insp_${it.packageName}_${it.apkPath}" }) { ov ->
                             var expandedOv by remember { mutableStateOf(false) }
-                            val isProvenFod = ov.fodRelevanceScore >= 40 || ov.lookupWinners.isNotEmpty() || ov.provenInLiveMaps
+                            val isProvenFod = ov.isStrictProvenFod || ov.bytecodeMatchedResourceKeys.isNotEmpty() || ov.fodRelevanceScore >= 40 || ov.lookupWinners.isNotEmpty() || ov.provenInLiveMaps
                             val borderColor = when {
                                 isProvenFod -> LocalFodStatusColors.current.confirmed.copy(alpha = 0.85f)
                                 ov.isEnabled -> MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
@@ -695,7 +714,9 @@ fun DiagnosticScreen(
                                         text = "${strings.arscScoreLabel}: ${ov.fodRelevanceScore}",
                                         color = if (isProvenFod) LocalFodStatusColors.current.confirmed else MaterialTheme.colorScheme.onSurfaceVariant
                                     )
-                                    if (ov.fodRelevanceScore >= 40) {
+                                    if (ov.bytecodeMatchedResourceKeys.isNotEmpty()) {
+                                        TagChip(strings.bytecodeProofBadge, LocalFodStatusColors.current.confirmed)
+                                    } else if (ov.isStrictProvenFod || ov.fodRelevanceScore >= 40) {
                                         TagChip(strings.provenFodBadge, LocalFodStatusColors.current.confirmed)
                                     }
                                     if (ov.provenInLiveMaps) {
@@ -737,6 +758,12 @@ fun DiagnosticScreen(
                                 AnimatedVisibility(visible = expandedOv) {
                                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                        if (ov.bytecodeMatchedResourceKeys.isNotEmpty()) {
+                                            Text(strings.bytecodeProofBadge, style = MaterialTheme.typography.labelSmall, color = LocalFodStatusColors.current.confirmed)
+                                            ov.bytecodeMatchedResourceKeys.forEach { k ->
+                                                Text("• $k", style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace), color = LocalFodStatusColors.current.confirmed)
+                                            }
+                                        }
                                         if (ov.lookupWinners.isNotEmpty()) {
                                             Text(strings.lookupWinnerBadge, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
                                             ov.lookupWinners.forEach { w ->
@@ -869,18 +896,45 @@ fun DiagnosticScreen(
                                     )
                                 }
                                 Text(
-                                    text = "${dex.archivePath} (${dex.targetHint})",
+                                    text = "${dex.archivePath} (${dex.targetHint}) [${dex.containerType}]",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.primary
                                 )
                                 Text(
-                                    text = "${dex.matchedClasses.size} classes · ${dex.matchedMethods.size} methods · ${dex.matchedStrings.size} FOD strings",
+                                    text = "${dex.matchedClasses.size} classes · ${dex.matchedMethods.size} methods · ${dex.methodTraces.size} traces · ${dex.resolvedResourceKeys.size} R.id keys",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                                 AnimatedVisibility(visible = expandedDex) {
                                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                        if (dex.resolvedResourceKeys.isNotEmpty()) {
+                                            Text(
+                                                text = "R.id: ${dex.resolvedResourceKeys.take(15).joinToString(", ")}",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                                color = LocalFodStatusColors.current.confirmed
+                                            )
+                                        }
+                                        if (dex.methodTraces.isNotEmpty()) {
+                                            Surface(
+                                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Text(
+                                                    text = dex.methodTraces.take(10).joinToString("\n\n") { tr ->
+                                                        buildString {
+                                                            appendLine(tr.fqMethod)
+                                                            if (tr.resolvedResKeys.isNotEmpty()) appendLine("  res: ${tr.resolvedResKeys.joinToString(", ")}")
+                                                            if (tr.invokedMethods.isNotEmpty()) appendLine("  calls: ${tr.invokedMethods.take(5).joinToString(" -> ")}")
+                                                            if (tr.bytecodeSnippet.isNotBlank()) append("  bytecode: ${tr.bytecodeSnippet}")
+                                                        }.trim()
+                                                    },
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                                    modifier = Modifier.padding(8.dp)
+                                                )
+                                            }
+                                        }
                                         if (dex.sourcePseudoSummary.isNotBlank()) {
                                             Surface(
                                                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
@@ -907,7 +961,7 @@ fun DiagnosticScreen(
                         }
                     }
 
-                    // Root Live Process /proc/<pid>/maps & fd Section
+                    // Root Live Process /proc/<pid>/maps, fd & threads Section
                     if (report.procLiveMaps.isNotEmpty()) {
                         item {
                             Text(
@@ -945,7 +999,7 @@ fun DiagnosticScreen(
                                     )
                                 }
                                 Text(
-                                    text = "${rec.mappedApks.size} APKs · ${rec.mappedJarsAndDex.size} JAR/DEX · ${rec.mappedLibs.size} .so · ${rec.openFds.size} FDs",
+                                    text = "${rec.mappedApks.size} APKs · ${rec.mappedJarsAndDex.size} JAR/DEX · ${rec.mappedLibs.size} .so · ${rec.openFds.size} FDs · ${rec.activeThreads.size} threads",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -959,6 +1013,9 @@ fun DiagnosticScreen(
                                 AnimatedVisibility(visible = expandedProc) {
                                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                        if (rec.activeThreads.isNotEmpty()) {
+                                            Text("Threads (/proc/task/*/comm):\n${rec.activeThreads.take(20).joinToString(", ")}", style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace))
+                                        }
                                         if (rec.enrollmentNewMappedFiles.isNotEmpty()) {
                                             Text("T0→T1 New Maps:", style = MaterialTheme.typography.labelSmall, color = LocalFodStatusColors.current.confirmed)
                                             Text(
@@ -981,6 +1038,55 @@ fun DiagnosticScreen(
                                         }
                                         if (rec.matchedFodPaths.isNotEmpty()) {
                                             Text("All Matched FOD Paths:\n${rec.matchedFodPaths.take(25).joinToString("\n")}", style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Kernel Binder IPC & HAL Link Traces Section
+                    if (report.binderTraces.isNotEmpty()) {
+                        item {
+                            Text(
+                                text = "${strings.binderTraceTitle} (${report.binderTraces.size})",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                        items(report.binderTraces, key = { "binder_${it.pid}_${it.processName}" }) { bt ->
+                            var expandedBt by remember { mutableStateOf(false) }
+                            TelemetrySectionCard(
+                                borderColor = if (bt.activeTransactions.isNotEmpty()) LocalFodStatusColors.current.confirmed.copy(alpha = 0.7f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+                                modifier = Modifier
+                                    .testTag("binder_trace_card_${bt.pid}")
+                                    .clickable { expandedBt = !expandedBt }
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("${bt.processName} (pid=${bt.pid})", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                                    Icon(
+                                        imageVector = if (expandedBt) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                                Text(
+                                    text = "nodes=${bt.incomingNodes} · refs=${bt.outgoingRefs} · peers=${bt.linkedPeerProcesses.size} · tx=${bt.activeTransactions.size}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                AnimatedVisibility(visible = expandedBt) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                        if (bt.linkedPeerProcesses.isNotEmpty()) {
+                                            Text("Peers:\n${bt.linkedPeerProcesses.take(15).joinToString("\n")}", style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace))
+                                        }
+                                        if (bt.activeTransactions.isNotEmpty()) {
+                                            Text("Transactions / Endpoints:\n${bt.activeTransactions.take(15).joinToString("\n")}", style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace), color = MaterialTheme.colorScheme.primary)
                                         }
                                     }
                                 }
@@ -1204,7 +1310,16 @@ private fun SummaryTabContent(
 ) {
     val strings = LocalAppStrings.current
     val statusColors = LocalFodStatusColors.current
+    val context = LocalContext.current
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (report.causalChain.isNotEmpty()) {
+            CausalChainSection(
+                links = report.causalChain,
+                title = strings.causalChainTitle,
+                filteredOverlayCount = report.filteredNonFodOverlayCount,
+                onCopyPath = { copyPathToClipboard(context, it) }
+            )
+        }
         TelemetrySectionCard {
             Text(strings.firstBreakTitle, style = MaterialTheme.typography.titleSmall, color = statusColors.failed)
             Text(report.summary.firstDemonstratedBreak, style = MaterialTheme.typography.bodyMedium)

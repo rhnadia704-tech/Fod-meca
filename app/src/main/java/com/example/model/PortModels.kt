@@ -82,5 +82,9 @@ data class PortAnalysisResult(
     val portingSolutions: List<PortingCandidateSolution>,
     val extractableFiles: List<ExtractableFileItem> = emptyList(),
     val aiProviderUsed: String = "",
-    val aiFactualSynthesis: String = ""
+    val aiFactualSynthesis: String = "",
+    val romCausalChain: List<CausalChainLink> = emptyList(),
+    val gsiCausalChain: List<CausalChainLink> = emptyList(),
+    val causalBreakSummary: String = "",
+    val filteredNonFodOverlayCount: Int = 0
 )

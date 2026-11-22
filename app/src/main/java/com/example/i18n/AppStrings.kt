@@ -161,7 +161,13 @@ data class AppStrings(
     val procLiveMapsTitle: String,
     val dexSourceExtractTitle: String,
     val pseudoXmlAndArscTitle: String,
-    val arscScoreLabel: String
+    val arscScoreLabel: String,
+    val causalChainTitle: String,
+    val strictRroTitle: String,
+    val binderTraceTitle: String,
+    val bytecodeProofBadge: String,
+    val filteredOverlaysNotice: String,
+    val portCausalDeltaTitle: String
 )
 
 val FrenchStrings = AppStrings(
@@ -308,7 +314,13 @@ val FrenchStrings = AppStrings(
     procLiveMapsTitle = "Processus FOD actifs (/proc/<pid>/maps & fd)",
     dexSourceExtractTitle = "Extraction Code Source DEX (Classes & Méthodes)",
     pseudoXmlAndArscTitle = "Code Source Décodé (Pseudo-XML & ARSC)",
-    arscScoreLabel = "Score FOD"
+    arscScoreLabel = "Score FOD",
+    causalChainTitle = "Chaîne Causale Complète FOD (RRO → Bytecode → Binder → HAL → Sysfs)",
+    strictRroTitle = "Overlays RRO FOD Prouvés par Bytecode & Lookup (0 Faux Positif)",
+    binderTraceTitle = "Transactions Binder Live & Liens HAL (/sys/kernel/debug/binder)",
+    bytecodeProofBadge = "PREUVE BYTECODE R.id",
+    filteredOverlaysNotice = "overlay(s) UI sans lien bytecode FOD ni gain lookup écartés",
+    portCausalDeltaTitle = "Comparatif Causal ROM vs GSI (Maillon par Maillon)"
 )
 
 val EnglishStrings = AppStrings(
@@ -455,7 +467,13 @@ val EnglishStrings = AppStrings(
     procLiveMapsTitle = "Live Active FOD Processes (/proc/<pid>/maps & fd)",
     dexSourceExtractTitle = "DEX Source-Level Extract (Classes & Methods)",
     pseudoXmlAndArscTitle = "Decoded Source (Pseudo-XML & ARSC)",
-    arscScoreLabel = "FOD Score"
+    arscScoreLabel = "FOD Score",
+    causalChainTitle = "End-to-End FOD Causal Chain (RRO → Bytecode → Binder → HAL → Sysfs)",
+    strictRroTitle = "Strict Bytecode & Lookup Proven FOD RRO Overlays (0 False Positives)",
+    binderTraceTitle = "Live Binder Transactions & HAL IPC Links",
+    bytecodeProofBadge = "BYTECODE R.id PROOF",
+    filteredOverlaysNotice = "UI overlay(s) lacking FOD bytecode reference or lookup win filtered out",
+    portCausalDeltaTitle = "ROM vs GSI Causal Chain Comparison (Link by Link)"
 )
 
 val LocalAppStrings = staticCompositionLocalOf { FrenchStrings }

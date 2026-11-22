@@ -7,6 +7,7 @@ import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Environment
 import android.view.Display
+import com.example.model.BinderTraceRecord
 import com.example.model.DexSourceExtract
 import com.example.model.EnvironmentSnapshot
 import com.example.model.FileProvenanceArtifact
@@ -47,7 +48,10 @@ data class BaselineProbeResult(
     val procLiveMaps: List<LiveProcessMapRecord> = emptyList(),
     val dexSourceExtracts: List<DexSourceExtract> = emptyList(),
     val procLiveMapsText: String = "",
-    val dexSourceExtractText: String = ""
+    val dexSourceExtractText: String = "",
+    val binderTraces: List<BinderTraceRecord> = emptyList(),
+    val binderTraceText: String = "",
+    val filteredNonFodOverlayCount: Int = 0
 )
 
 data class LivePollSnapshot(
@@ -55,7 +59,8 @@ data class LivePollSnapshot(
     val sysfsValues: Map<String, String>,
     val newDmesgCount: Int,
     val surfaceFlingerFodLayers: List<String>,
-    val fodActivityDetected: Boolean
+    val fodActivityDetected: Boolean,
+    val sfLayerDetails: List<String> = emptyList()
 )
 
 data class FinalSessionCapture(
@@ -64,7 +69,9 @@ data class FinalSessionCapture(
     val surfaceFlingerLiveDelta: String,
     val sysfsTransitions: List<SysfsTransition>,
     val procLiveMaps: List<LiveProcessMapRecord> = emptyList(),
-    val procLiveMapsText: String = ""
+    val procLiveMapsText: String = "",
+    val binderTraces: List<BinderTraceRecord> = emptyList(),
+    val binderTraceDeltaText: String = ""
 )
 
 class SystemProbeCollector(private val context: Context) {
@@ -261,6 +268,23 @@ class SystemProbeCollector(private val context: Context) {
             if (effectiveRoot) "NO_ACTIVE_FOD_PROCESS_MAPS" else "PROC_MAPS_UNAVAILABLE (root required for /proc/<pid>/maps)"
         }
 
+        val baselineBinderTraces = if (effectiveRoot) {
+            collectBinderTraceRecords(
+                procMaps = procMapsBaseline,
+                serviceList = serviceListRes,
+                lshalOutput = lshalRes,
+                dumpsysBiometric = dumpsysBio,
+                accessLimitations = accessLimitations
+            )
+        } else {
+            emptyList()
+        }
+        val baselineBinderText = if (baselineBinderTraces.isNotEmpty()) {
+            serializeBinderTraces(baselineBinderTraces, "BASELINE BINDER TRANSACTIONS (T0)")
+        } else {
+            if (effectiveRoot) "NO_ACTIVE_BINDER_DEBUGFS_NODES" else "BINDER_TRACE_UNAVAILABLE (root required)"
+        }
+
         val bootSig = listOfNotNull(
             propMap["ro.bootimage.build.fingerprint"],
             propMap["ro.boot.vbmeta.digest"],
@@ -329,7 +353,10 @@ class SystemProbeCollector(private val context: Context) {
             procLiveMaps = procMapsBaseline,
             dexSourceExtracts = provenanceBundle.dexSourceExtracts,
             procLiveMapsText = procMapsText,
-            dexSourceExtractText = provenanceBundle.dexSourceExtractText
+            dexSourceExtractText = provenanceBundle.dexSourceExtractText,
+            binderTraces = baselineBinderTraces,
+            binderTraceText = baselineBinderText,
+            filteredNonFodOverlayCount = provenanceBundle.filteredNonFodOverlayCount
         )
     }
 
@@ -367,20 +394,35 @@ class SystemProbeCollector(private val context: Context) {
             emptyList()
         }
         val sfDelta = sfLayers.filter { it !in baseline.baselineSurfaceFlingerLayers }
+        val sfLayerDetails = if (effectiveRoot && (sfDelta.isNotEmpty() || anySysfsChanged || newDmesg.isNotEmpty())) {
+            ShellExecutor.exec(
+                "dumpsys SurfaceFlinger 2>/dev/null | grep -iE -B 1 -A 4 'udfps|fod|hbm|lhbm|biometric|dimlayer' | head -n 50",
+                useRoot = true,
+                timeoutMs = 3_500L
+            ).stdout.lines()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .take(30)
+        } else {
+            emptyList()
+        }
 
         return LivePollSnapshot(
             observedLogCount = observedLogs,
             sysfsValues = currentSysfs,
             newDmesgCount = newDmesg.size,
             surfaceFlingerFodLayers = sfDelta,
-            fodActivityDetected = anySysfsChanged || sfDelta.isNotEmpty() || newDmesg.isNotEmpty() || observedLogs > 0
+            fodActivityDetected = anySysfsChanged || sfDelta.isNotEmpty() || newDmesg.isNotEmpty() || observedLogs > 0,
+            sfLayerDetails = sfLayerDetails
         )
     }
 
     suspend fun captureFinalSessionDiff(
         baseline: BaselineProbeResult,
         liveSysfsHistory: Map<String, List<String>>,
-        liveObservedSfLayers: Set<String>
+        liveObservedSfLayers: Set<String>,
+        liveObservedSfDetails: List<String> = emptyList()
     ): FinalSessionCapture {
         val effectiveRoot = baseline.environment.rootGranted
         val liveLogcat = captureLiveEnrollmentLogs(
@@ -410,8 +452,17 @@ class SystemProbeCollector(private val context: Context) {
             .distinct()
         val sfDeltaText = when {
             !effectiveRoot -> "SURFACEFLINGER_LIVE_UNAVAILABLE (root required)"
-            allLiveSfDelta.isEmpty() -> "NO_NEW_FOD_SURFACE_LAYER_OBSERVED"
-            else -> allLiveSfDelta.joinToString("\n")
+            allLiveSfDelta.isEmpty() && liveObservedSfDetails.isEmpty() -> "NO_NEW_FOD_SURFACE_LAYER_OBSERVED"
+            else -> buildString {
+                if (allLiveSfDelta.isNotEmpty()) {
+                    appendLine("=== NEW FOD/HBM SURFACE LAYERS ===")
+                    allLiveSfDelta.forEach { appendLine(it) }
+                }
+                if (liveObservedSfDetails.isNotEmpty()) {
+                    appendLine("=== LIVE HBM/UDFPS LAYER PROPERTIES (T_finger_down) ===")
+                    liveObservedSfDetails.distinct().take(40).forEach { appendLine(it) }
+                }
+            }.trim()
         }
 
         val finalSysfsMap = readSysfsMapQuick(effectiveRoot, baseline.discoveredSysfsPaths.take(30))
@@ -441,13 +492,33 @@ class SystemProbeCollector(private val context: Context) {
             baseline.procLiveMapsText
         }
 
+        val postBinderTraces = if (effectiveRoot) {
+            val post = collectBinderTraceRecords(
+                procMaps = mergedProcMaps,
+                serviceList = baseline.serviceList,
+                lshalOutput = baseline.lshalOutput,
+                dumpsysBiometric = baseline.dumpsysBiometric,
+                accessLimitations = null
+            )
+            if (post.isNotEmpty()) post else baseline.binderTraces
+        } else {
+            baseline.binderTraces
+        }
+        val finalBinderText = if (postBinderTraces.isNotEmpty()) {
+            serializeBinderTraces(postBinderTraces, "ENROLLMENT BINDER TRANSACTIONS & HAL IPC LINKS (T0->T1)")
+        } else {
+            baseline.binderTraceText
+        }
+
         return FinalSessionCapture(
             liveLogcat = liveLogcat,
             dmesgDelta = dmesgDeltaText,
             surfaceFlingerLiveDelta = sfDeltaText,
             sysfsTransitions = transitions,
             procLiveMaps = mergedProcMaps,
-            procLiveMapsText = mergedProcText
+            procLiveMapsText = mergedProcText,
+            binderTraces = postBinderTraces,
+            binderTraceDeltaText = finalBinderText
         )
     }
 
@@ -481,9 +552,67 @@ class SystemProbeCollector(private val context: Context) {
         }
 
         val pidList = pidToName.keys.take(10).joinToString(" ")
-        val script = "for p in $pidList; do echo \"=== PID \$p ===\"; grep -oE '/[^[:space:]]+\\.(apk|jar|so|oat|vdex)' \"/proc/\$p/maps\" 2>/dev/null | sort -u | head -n 220; echo \"--- FD \$p ---\"; ls -l \"/proc/\$p/fd\" 2>/dev/null | grep -oE '/(dev|sys|vendor|product|system|system_ext|apex|data)[^[:space:]]*' | sort -u | head -n 80; done"
-        val res = ShellExecutor.exec(script, useRoot = true, timeoutMs = 8_000L)
+        val script = "for p in $pidList; do echo \"=== PID \$p ===\"; grep -oE '/[^[:space:]]+\\.(apk|jar|so|oat|vdex|odex)' \"/proc/\$p/maps\" 2>/dev/null | sort -u | head -n 240; echo \"--- FD \$p ---\"; ls -l \"/proc/\$p/fd\" 2>/dev/null | grep -oE '/(dev|sys|vendor|product|system|system_ext|apex|data)[^[:space:]]*' | sort -u | head -n 80; echo \"--- THR \$p ---\"; cat \"/proc/\$p/task\"/*/comm 2>/dev/null | sort -u | head -n 40; done"
+        val res = ShellExecutor.exec(script, useRoot = true, timeoutMs = 8_500L)
         return parseProcMapsOutput(res.stdout, pidToName)
+    }
+
+    internal suspend fun collectBinderTraceRecords(
+        procMaps: List<LiveProcessMapRecord>,
+        serviceList: String,
+        lshalOutput: String,
+        dumpsysBiometric: String,
+        accessLimitations: MutableList<String>?
+    ): List<BinderTraceRecord> {
+        val pidToName = procMaps.associate { it.pid to it.processName }.toMutableMap()
+        if (pidToName.isEmpty()) {
+            val psOut = ShellExecutor.exec(
+                "ps -A -o PID,NAME 2>/dev/null | grep -iE 'systemui|system_server|surfaceflinger|fingerprint|biometric|goodix|fpc|silead|focal|egis|displayfeature' | head -n 10",
+                useRoot = true,
+                timeoutMs = 4_000L
+            ).stdout
+            psOut.lineSequence().forEach { line ->
+                val parts = line.trim().split(Regex("\\s+"), limit = 2)
+                val pid = parts.getOrNull(0)?.toIntOrNull()
+                val name = parts.getOrNull(1)?.trim()
+                if (pid != null && pid > 0 && !name.isNullOrBlank()) pidToName[pid] = name
+            }
+        }
+        if (pidToName.isEmpty()) return emptyList()
+
+        val pidList = pidToName.keys.take(8).joinToString(" ")
+        val script = "for p in $pidList; do echo \"=== BINDER_PID \$p ===\"; if [ -r \"/sys/kernel/debug/binder/proc/\$p\" ]; then head -n 120 \"/sys/kernel/debug/binder/proc/\$p\" 2>/dev/null; elif [ -r \"/dev/binderfs/binder_logs/proc/\$p\" ]; then head -n 120 \"/dev/binderfs/binder_logs/proc/\$p\" 2>/dev/null; fi; done"
+        val rawBinder = ShellExecutor.exec(script, useRoot = true, timeoutMs = 6_500L).stdout
+        val parsed = parseBinderDebugOutput(rawBinder, pidToName).toMutableList()
+
+        if (parsed.isEmpty()) {
+            accessLimitations?.add("Kernel binder debugfs (/sys/kernel/debug/binder/proc or /dev/binderfs/binder_logs/proc) unreadable; falling back to IPC endpoint correlation.")
+            // Correlate active biometric/fingerprint Binder services & mapped HAL PIDs without fabricating transactions
+            val ipcEndpoints = (serviceList + "\n" + lshalOutput + "\n" + dumpsysBiometric)
+                .lineSequence()
+                .map { it.trim() }
+                .filter {
+                    val l = it.lowercase()
+                    l.contains("fingerprint") || l.contains("biometric") || l.contains("udfps") || l.contains("displayfeature")
+                }
+                .distinct()
+                .take(10)
+                .toList()
+            if (ipcEndpoints.isNotEmpty()) {
+                procMaps.take(4).forEach { rec ->
+                    val peerProcs = procMaps.filter { it.pid != rec.pid }.map { "${it.processName}(${it.pid})" }
+                    parsed += BinderTraceRecord(
+                        pid = rec.pid,
+                        processName = rec.processName,
+                        incomingNodes = 0,
+                        outgoingRefs = ipcEndpoints.size,
+                        activeTransactions = ipcEndpoints.take(5).map { "IPC_ENDPOINT: ${it.take(120)}" },
+                        linkedPeerProcesses = peerProcs.take(6)
+                    )
+                }
+            }
+        }
+        return parsed
     }
 
     suspend fun captureLiveEnrollmentLogs(
@@ -897,15 +1026,19 @@ class SystemProbeCollector(private val context: Context) {
             if (raw.isBlank()) return emptyList()
             val out = mutableListOf<LiveProcessMapRecord>()
             var currentPid: Int? = null
-            var inFds = false
+            var section = 0 // 0=maps, 1=fds, 2=threads
             val mapped = linkedSetOf<String>()
             val fds = linkedSetOf<String>()
+            val threads = linkedSetOf<String>()
 
             fun flush() {
                 val pid = currentPid ?: return
                 val name = pidToName[pid] ?: "pid_$pid"
                 val apks = mapped.filter { it.endsWith(".apk", true) }
-                val jars = mapped.filter { it.endsWith(".jar", true) || it.endsWith(".oat", true) || it.endsWith(".vdex", true) }
+                val jars = mapped.filter {
+                    it.endsWith(".jar", true) || it.endsWith(".oat", true) ||
+                        it.endsWith(".vdex", true) || it.endsWith(".odex", true)
+                }
                 val libs = mapped.filter { it.endsWith(".so", true) }
                 val fodMatches = (mapped + fds).filter {
                     fodKeywordRegex.containsMatchIn(it) || it.contains("overlay", true) || it.contains("/sys/") || it.contains("/dev/")
@@ -917,7 +1050,8 @@ class SystemProbeCollector(private val context: Context) {
                     mappedJarsAndDex = jars.take(80),
                     mappedLibs = libs.take(100),
                     openFds = fds.toList().take(60),
-                    matchedFodPaths = fodMatches.take(60)
+                    matchedFodPaths = fodMatches.take(60),
+                    activeThreads = threads.toList().take(30)
                 )
             }
 
@@ -927,15 +1061,16 @@ class SystemProbeCollector(private val context: Context) {
                     t.startsWith("=== PID ") -> {
                         flush()
                         currentPid = t.removePrefix("=== PID ").removeSuffix("===").trim().toIntOrNull()
-                        inFds = false
+                        section = 0
                         mapped.clear()
                         fds.clear()
+                        threads.clear()
                     }
-                    t.startsWith("--- FD ") -> {
-                        inFds = true
-                    }
+                    t.startsWith("--- FD ") -> section = 1
+                    t.startsWith("--- THR ") -> section = 2
+                    section == 2 && t.isNotBlank() && !t.startsWith("cat:") -> threads += t
                     t.startsWith("/") -> {
-                        if (inFds) fds += t else mapped += t
+                        if (section == 1) fds += t else mapped += t
                     }
                 }
             }
@@ -962,10 +1097,129 @@ class SystemProbeCollector(private val context: Context) {
                     val newFds = p.openFds.filter { it !in baseFds }
                     p.copy(
                         enrollmentNewMappedFiles = newMaps.take(30),
-                        enrollmentNewFds = newFds.take(30)
+                        enrollmentNewFds = newFds.take(30),
+                        activeThreads = (b.activeThreads + p.activeThreads).distinct().take(30)
                     )
                 }
             }
+        }
+
+        internal fun parseBinderDebugOutput(
+            raw: String,
+            pidToName: Map<Int, String>
+        ): List<BinderTraceRecord> {
+            if (raw.isBlank()) return emptyList()
+            val out = mutableListOf<BinderTraceRecord>()
+            var currentPid: Int? = null
+            var nodes = 0
+            var refs = 0
+            val transactions = linkedSetOf<String>()
+            val peers = linkedSetOf<String>()
+            val peerPidRegex = Regex("\\b(?:proc|from|to)\\s+(\\d+)\\b")
+
+            fun flush() {
+                val pid = currentPid ?: return
+                if (nodes == 0 && refs == 0 && transactions.isEmpty()) return
+                val procName = pidToName[pid] ?: "pid_$pid"
+                out += BinderTraceRecord(
+                    pid = pid,
+                    processName = procName,
+                    incomingNodes = nodes,
+                    outgoingRefs = refs,
+                    activeTransactions = transactions.toList().take(20),
+                    linkedPeerProcesses = peers.toList().take(15)
+                )
+            }
+
+            for (line in raw.lineSequence()) {
+                val t = line.trim()
+                if (t.startsWith("=== BINDER_PID ")) {
+                    flush()
+                    currentPid = t.removePrefix("=== BINDER_PID ").removeSuffix("===").trim().toIntOrNull()
+                    nodes = 0; refs = 0; transactions.clear(); peers.clear()
+                    continue
+                }
+                if (currentPid == null || t.isBlank()) continue
+                when {
+                    t.startsWith("node ") -> nodes++
+                    t.startsWith("ref ") -> {
+                        refs++
+                        val targetNode = Regex("node\\s+(\\d+)").find(t)?.groupValues?.get(1)
+                        val desc = Regex("desc\\s+(\\d+)").find(t)?.groupValues?.get(1)
+                        if (targetNode != null && desc != null && transactions.size < 16) {
+                            transactions += "binder_ref(desc=$desc -> node=$targetNode)"
+                        }
+                    }
+                    t.contains("transaction", ignoreCase = true) || t.contains("pending", ignoreCase = true) -> {
+                        transactions += t.take(150)
+                    }
+                }
+                peerPidRegex.findAll(t).forEach { m ->
+                    val peerPid = m.groupValues[1].toIntOrNull() ?: return@forEach
+                    if (peerPid != currentPid) {
+                        val peerLabel = pidToName[peerPid]?.let { "$it($peerPid)" } ?: "pid_$peerPid"
+                        peers += peerLabel
+                    }
+                }
+            }
+            flush()
+            return out
+        }
+
+        fun serializeBinderTraces(
+            list: List<BinderTraceRecord>,
+            title: String = "LIVE BINDER TRACE"
+        ): String = buildString {
+            appendLine("=== $title (${list.size} processes) ===")
+            list.forEach { rec ->
+                appendLine("BINDER_PROC: ${rec.processName} (pid=${rec.pid}) nodes=${rec.incomingNodes} refs=${rec.outgoingRefs}")
+                rec.linkedPeerProcesses.forEach { appendLine("  PEER: $it") }
+                rec.activeTransactions.forEach { appendLine("  TX: $it") }
+                appendLine()
+            }
+        }
+
+        fun parseBinderTraceText(raw: String): List<BinderTraceRecord> {
+            if (raw.isBlank()) return emptyList()
+            val out = mutableListOf<BinderTraceRecord>()
+            var procName = ""
+            var pid = 0
+            var nodes = 0
+            var refs = 0
+            val peers = mutableListOf<String>()
+            val txs = mutableListOf<String>()
+
+            fun flush() {
+                if (procName.isBlank()) return
+                out += BinderTraceRecord(
+                    pid = pid,
+                    processName = procName,
+                    incomingNodes = nodes,
+                    outgoingRefs = refs,
+                    activeTransactions = txs.toList(),
+                    linkedPeerProcesses = peers.toList()
+                )
+            }
+
+            val headerRegex = Regex("^BINDER_PROC:\\s+(.+?)\\s+\\(pid=(\\d+)\\)\\s+nodes=(\\d+)\\s+refs=(\\d+)")
+            for (line in raw.lineSequence()) {
+                val t = line.trim()
+                val m = headerRegex.matchEntire(t)
+                if (m != null) {
+                    flush()
+                    procName = m.groupValues[1].trim()
+                    pid = m.groupValues[2].toIntOrNull() ?: 0
+                    nodes = m.groupValues[3].toIntOrNull() ?: 0
+                    refs = m.groupValues[4].toIntOrNull() ?: 0
+                    peers.clear(); txs.clear()
+                } else if (t.startsWith("PEER:")) {
+                    peers += t.removePrefix("PEER:").trim()
+                } else if (t.startsWith("TX:")) {
+                    txs += t.removePrefix("TX:").trim()
+                }
+            }
+            flush()
+            return out
         }
     }
 }

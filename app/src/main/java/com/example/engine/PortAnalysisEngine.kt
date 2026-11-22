@@ -1,6 +1,9 @@
 package com.example.engine
 
 import com.example.i18n.AppLanguage
+import com.example.model.BinderTraceRecord
+import com.example.model.CausalChainLink
+import com.example.model.DexMethodTrace
 import com.example.model.DexSourceExtract
 import com.example.model.EvidenceStatus
 import com.example.model.ExtractableFileItem
@@ -119,6 +122,14 @@ object PortAnalysisEngine {
             language = language
         )
 
+        val romChain = resolveZipCausalChain(romZip, romOverlays.values.toList(), language)
+        val gsiChain = resolveZipCausalChain(gsiZip, gsiOverlays.values.toList(), language)
+        val causalBreakSummary = computeCausalBreakSummary(romChain, gsiChain, language)
+        val rejectedNonFodCount = maxOf(
+            romZip.report?.filteredNonFodOverlayCount ?: 0,
+            parseFilteredNonFodCount(readRaw(romZip, "raw/overlay_deep_inspect.txt"))
+        ) + sortedNoise.count { it.category == "GENERIC_UI_RRO_NOISE" }
+
         val nowIso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).format(Date())
         return PortAnalysisResult(
             createdAtIso = nowIso,
@@ -135,7 +146,11 @@ object PortAnalysisEngine {
             filteredSharedNoiseCount = sortedNoise.size,
             sharedNoiseSamples = sortedNoise,
             portingSolutions = solutions,
-            extractableFiles = extractableFiles
+            extractableFiles = extractableFiles,
+            romCausalChain = romChain,
+            gsiCausalChain = gsiChain,
+            causalBreakSummary = causalBreakSummary,
+            filteredNonFodOverlayCount = rejectedNonFodCount
         )
     }
 
@@ -246,7 +261,9 @@ object PortAnalysisEngine {
         val allNames = (romLines.keys + gsiLines.keys + romOverlays.keys + gsiOverlays.keys).distinct()
 
         val romDeepScannedFod = romOverlays.values.any {
-            it.fodRelevanceScore >= 30 ||
+            it.isStrictProvenFod ||
+                it.bytecodeMatchedResourceKeys.isNotEmpty() ||
+                it.fodRelevanceScore >= 30 ||
                 it.fodConfigEntries.isNotEmpty() ||
                 it.lookupWinners.isNotEmpty() ||
                 it.decodedArscEntries.any { e -> fodArscSignalRegex.containsMatchIn(e) }
@@ -258,12 +275,15 @@ object PortAnalysisEngine {
             val rEnabled = romLines[pkg] ?: rDeep?.isEnabled
             val gEnabled = gsiLines[pkg] ?: gDeep?.isEnabled
             val hasDeepFodSignal = rDeep != null && (
-                rDeep.fodRelevanceScore >= 30 ||
+                rDeep.isStrictProvenFod ||
+                    rDeep.bytecodeMatchedResourceKeys.isNotEmpty() ||
+                    rDeep.fodRelevanceScore >= 30 ||
                     rDeep.fodConfigEntries.isNotEmpty() ||
                     rDeep.lookupWinners.isNotEmpty() ||
                     rDeep.decodedArscEntries.any { fodArscSignalRegex.containsMatchIn(it) }
                 )
             val isBiometricOrDisplayOverlay = hasDeepFodSignal ||
+                rDeep != null ||
                 pkg.contains("fod", true) || pkg.contains("udfps", true) ||
                 pkg.contains("fingerprint", true) || pkg.contains("biometric", true) ||
                 pkg.contains("treble", true) || pkg.contains("systemui", true) ||
@@ -272,8 +292,9 @@ object PortAnalysisEngine {
 
             val romLocNote = rDeep?.let { ov ->
                 buildString {
-                    append("Score=${ov.fodRelevanceScore} | liveMapped=${ov.provenInLiveMaps} | APK=${ov.apkPath} (Dir=${ov.directory})")
+                    append("Strict=${ov.isStrictProvenFod} | Score=${ov.fodRelevanceScore} | liveMapped=${ov.provenInLiveMaps} | APK=${ov.apkPath} (Dir=${ov.directory})")
                     if (ov.targetPackage.isNotBlank()) append(" -> target=${ov.targetPackage}")
+                    if (ov.bytecodeMatchedResourceKeys.isNotEmpty()) append(" | BytecodeKeys: ${ov.bytecodeMatchedResourceKeys.take(3).joinToString("; ")}")
                     if (ov.lookupWinners.isNotEmpty()) append(" | Lookup: ${ov.lookupWinners.take(3).joinToString("; ")}")
                     val keys = (ov.decodedArscEntries + ov.fodConfigEntries).distinct()
                     if (keys.isNotEmpty()) append(" | Keys: ${keys.take(6).joinToString("; ")}")
@@ -284,6 +305,7 @@ object PortAnalysisEngine {
                 rEnabled == true && (gEnabled == null || gEnabled == false) -> {
                     val isKnownExplicitGenericUi = pkg.contains("ambientcue", true) || pkg.contains("navbar", true)
                     val inspectedWithoutFodContent = rDeep != null &&
+                        !rDeep.isStrictProvenFod &&
                         !hasDeepFodSignal &&
                         rDeep.apkPath != "UNKNOWN" &&
                         romDeepScannedFod &&
@@ -301,9 +323,9 @@ object PortAnalysisEngine {
                         gsiEvidence = if (gEnabled == null) "ABSENT" else "[ ] INACTIVE (${gDeep?.apkPath ?: "unknown path"})",
                         impact = if (inspectedWithoutFodContent) {
                             if (language == AppLanguage.FR) {
-                                "Overlay UI générique inspecté (${rDeep.apkPath}) contenant 0 clé FOD/UDFPS/HBM/Biometric décodée → écarté comme non pertinent."
+                                "Overlay UI générique inspecté (${rDeep.apkPath}) sans preuve bytecode/ARSC FOD → écarté comme faux positif."
                             } else {
-                                "Generic UI overlay inspected (${rDeep.apkPath}) containing 0 decoded FOD/UDFPS/HBM/Biometric keys → filtered as non-FOD noise."
+                                "Generic UI overlay inspected (${rDeep.apkPath}) with zero bytecode/ARSC FOD proof → rejected as false positive."
                             }
                         } else if (language == AppLanguage.FR) {
                             "Overlay RRO actif sur Custom ROM mais absent/inactif sur GSI" +
@@ -721,25 +743,51 @@ object PortAnalysisEngine {
         val rDex = readRaw(romZip, "raw/dex_source_extract.txt")
         val gDex = readRaw(gsiZip, "raw/dex_source_extract.txt")
         if (rDex.isNotBlank()) {
-            val dexLineRegex = Regex("^(CLASS|METHOD|STRING):\\s*(.+)$")
+            val dexLineRegex = Regex("^(CLASS|METHOD|STRING|RES_KEY|TRACE_METHOD|TRACE_RES|TRACE_CALL):\\s*(.+)$")
             val rDexLines = rDex.lineSequence().mapNotNull { line ->
                 val t = line.trim()
                 if (dexLineRegex.matches(t)) t else null
             }.distinct().toList()
             val gDexLines = gDex.lineSequence().map { it.trim() }.toHashSet()
-            val uniqueRomHooks = rDexLines.filter { it !in gDexLines }.take(20)
+            val uniqueRomHooks = rDexLines.filter { it !in gDexLines }.take(24)
             if (uniqueRomHooks.isNotEmpty()) {
                 diffs += PortFileDiffItem(
                     id = "dex_hooks_unique_rom",
                     sourceFile = "raw/dex_source_extract.txt",
                     category = "DEX SOURCE HOOKS",
-                    title = "Classes/Méthodes FOD extraites du code DEX Custom ROM absentes sur GSI",
+                    title = "Classes/Méthodes/Bytecode FOD extraits du code DEX/VDEX ROM absents sur GSI",
                     romEvidence = uniqueRomHooks.joinToString("\n"),
                     gsiEvidence = if (gDex.isBlank()) "(raw/dex_source_extract.txt absent)" else "Hooks manquants dans SystemUI/Framework GSI",
                     impact = if (language == AppLanguage.FR) {
-                        "Code source DEX réel (SystemUI / services.jar / APEX biométrique) implémentant le pont UDFPS/HBM/extCmd sur la Custom ROM."
+                        "Code source DEX/VDEX réel (SystemUI / services.jar / APEX biométrique) et appels R.id UDFPS/HBM/extCmd sur la Custom ROM."
                     } else {
-                        "Actual DEX source hooks (SystemUI / services.jar / biometric APEX) implementing the UDFPS/HBM/extCmd bridge in Custom ROM."
+                        "Actual DEX/VDEX bytecode hooks (SystemUI / services.jar / biometric APEX) and UDFPS/HBM/extCmd R.id references in Custom ROM."
+                    },
+                    status = EvidenceStatus.FAILED,
+                    knowledgeLevel = KnowledgeLevel.FACT
+                )
+            }
+        }
+
+        val rBinder = readRaw(romZip, "raw/binder_trace_delta.txt")
+        val gBinder = readRaw(gsiZip, "raw/binder_trace_delta.txt")
+        if (rBinder.isNotBlank() && !rBinder.startsWith("BINDER_TRACE_UNAVAILABLE")) {
+            val binderRegex = Regex("^(PEER|TX):\\s*(.+)$")
+            val rLinks = rBinder.lineSequence().mapNotNull { binderRegex.matchEntire(it.trim())?.value }.distinct().toList()
+            val gLinks = gBinder.lineSequence().map { it.trim() }.toHashSet()
+            val onlyRomBinder = rLinks.filter { it !in gLinks }.take(16)
+            if (onlyRomBinder.isNotEmpty()) {
+                diffs += PortFileDiffItem(
+                    id = "binder_ipc_unique_rom",
+                    sourceFile = "raw/binder_trace_delta.txt",
+                    category = "BINDER IPC / HAL LINKS",
+                    title = "Liens Binder IPC & Transactions HAL observés sur ROM mais absents sur GSI",
+                    romEvidence = onlyRomBinder.joinToString("\n"),
+                    gsiEvidence = if (gBinder.isBlank()) "(raw/binder_trace_delta.txt absent)" else "${gLinks.size} lignes Binder GSI sans ces liens",
+                    impact = if (language == AppLanguage.FR) {
+                        "Transactions Binder entre SystemUI/system_server et le HAL vendor manquantes côté GSI."
+                    } else {
+                        "Binder IPC links between SystemUI/system_server and vendor HAL missing on GSI."
                     },
                     status = EvidenceStatus.FAILED,
                     knowledgeLevel = KnowledgeLevel.FACT
@@ -1353,6 +1401,12 @@ object PortAnalysisEngine {
         return out
     }
 
+    internal fun parseFilteredNonFodCount(raw: String): Int {
+        if (raw.isBlank()) return 0
+        Regex("FILTERED_NON_FOD_COUNT=(\\d+)").find(raw)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        return Regex("(\\d+)\\s+generic UI filtered").find(raw)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+    }
+
     internal fun parseOverlayInspectText(raw: String): List<OverlayDeepInspection> {
         if (raw.isBlank()) return emptyList()
         val list = mutableListOf<OverlayDeepInspection>()
@@ -1364,11 +1418,13 @@ object PortAnalysisEngine {
         var apkPath = "UNKNOWN"
         var dir = "UNKNOWN"
         var parsedScore: Int? = null
+        var parsedStrict: Boolean? = null
         var liveMapped = false
         val manifest = mutableListOf<String>()
         val configs = mutableListOf<String>()
         val lookupWinners = mutableListOf<String>()
         val decodedArsc = mutableListOf<String>()
+        val bytecodeMatched = mutableListOf<String>()
         val xmlLines = mutableListOf<String>()
         var inPseudoXml = false
 
@@ -1387,10 +1443,18 @@ object PortAnalysisEngine {
                 provenInLiveMaps = liveMapped,
                 lookupWinners = lookupWinners.toList(),
                 pseudoXmlSource = xmlLines.joinToString("\n"),
-                decodedArscEntries = decodedArsc.toList()
+                decodedArscEntries = decodedArsc.toList(),
+                bytecodeMatchedResourceKeys = bytecodeMatched.toList()
             )
             val finalScore = parsedScore ?: DynamicProvenanceInspector.computeFodOverlayScore(prelim)
-            list += prelim.copy(fodRelevanceScore = finalScore)
+            val finalStrict = parsedStrict ?: (
+                bytecodeMatched.isNotEmpty() ||
+                    lookupWinners.isNotEmpty() ||
+                    configs.isNotEmpty() ||
+                    decodedArsc.any { fodArscSignalRegex.containsMatchIn(it) } ||
+                    finalScore >= 40
+                )
+            list += prelim.copy(fodRelevanceScore = finalScore, isStrictProvenFod = finalStrict)
         }
 
         for (line in raw.lineSequence()) {
@@ -1411,8 +1475,9 @@ object PortAnalysisEngine {
                 pkg = t.removePrefix("OVERLAY:").trim()
                 enabled = false; isStatic = false; priority = 0; target = ""
                 apkPath = "UNKNOWN"; dir = "UNKNOWN"
-                parsedScore = null; liveMapped = false; inPseudoXml = false
-                manifest.clear(); configs.clear(); lookupWinners.clear(); decodedArsc.clear(); xmlLines.clear()
+                parsedScore = null; parsedStrict = null; liveMapped = false; inPseudoXml = false
+                manifest.clear(); configs.clear(); lookupWinners.clear(); decodedArsc.clear()
+                bytecodeMatched.clear(); xmlLines.clear()
             } else if (t.startsWith("ENABLED=")) {
                 enabled = t.contains("ENABLED=true", true)
                 isStatic = t.contains("STATIC=true", true)
@@ -1420,10 +1485,15 @@ object PortAnalysisEngine {
                 target = Regex("TARGET=([^|\\s]*)").find(t)?.groupValues?.get(1).orEmpty()
                 parsedScore = Regex("SCORE=(\\d+)").find(t)?.groupValues?.get(1)?.toIntOrNull()
                 liveMapped = t.contains("LIVE_MAPPED=true", true)
+                if (t.contains("STRICT_PROVEN=", true)) {
+                    parsedStrict = t.contains("STRICT_PROVEN=true", true)
+                }
             } else if (t.startsWith("APK_PATH=")) {
                 apkPath = t.removePrefix("APK_PATH=").trim()
             } else if (t.startsWith("DIRECTORY=")) {
                 dir = t.removePrefix("DIRECTORY=").trim()
+            } else if (t.startsWith("BYTECODE_MATCH:")) {
+                bytecodeMatched += t.removePrefix("BYTECODE_MATCH:").trim()
             } else if (t.startsWith("LOOKUP_WINNER:")) {
                 lookupWinners += t.removePrefix("LOOKUP_WINNER:").trim()
             } else if (t.startsWith("ARSC_ENTRY:")) {
@@ -1446,13 +1516,33 @@ object PortAnalysisEngine {
         val out = mutableListOf<DexSourceExtract>()
         var archivePath = ""
         var targetHint = ""
+        var containerType = "APK/JAR"
         val classes = mutableListOf<String>()
         val methods = mutableListOf<String>()
         val strings = mutableListOf<String>()
+        val resolvedKeys = mutableListOf<String>()
+        val traces = mutableListOf<DexMethodTrace>()
+        var curTraceMethod = ""
+        val curTraceRes = mutableListOf<String>()
+        val curTraceCalls = mutableListOf<String>()
+        val curTraceStrs = mutableListOf<String>()
         val outline = mutableListOf<String>()
         var inOutline = false
 
+        fun flushTrace() {
+            if (curTraceMethod.isBlank()) return
+            traces += DexMethodTrace(
+                fqMethod = curTraceMethod,
+                invokedMethods = curTraceCalls.toList(),
+                resolvedResKeys = curTraceRes.toList(),
+                referencedStrings = curTraceStrs.toList()
+            )
+            curTraceMethod = ""
+            curTraceRes.clear(); curTraceCalls.clear(); curTraceStrs.clear()
+        }
+
         fun flush() {
+            flushTrace()
             if (archivePath.isBlank()) return
             out += DexSourceExtract(
                 archivePath = archivePath,
@@ -1460,7 +1550,10 @@ object PortAnalysisEngine {
                 matchedClasses = classes.toList(),
                 matchedMethods = methods.toList(),
                 matchedStrings = strings.toList(),
-                sourcePseudoSummary = outline.joinToString("\n")
+                sourcePseudoSummary = outline.joinToString("\n"),
+                containerType = containerType,
+                methodTraces = traces.toList(),
+                resolvedResourceKeys = resolvedKeys.toList()
             )
         }
 
@@ -1474,9 +1567,21 @@ object PortAnalysisEngine {
                     flush()
                     val body = t.removePrefix("DEX_ARCHIVE:").trim()
                     archivePath = body.substringBefore(" (").trim()
-                    targetHint = body.substringAfter("(", "").removeSuffix(")").trim()
-                    classes.clear(); methods.clear(); strings.clear(); outline.clear(); inOutline = false
+                    targetHint = body.substringAfter("(", "").substringBefore(")").trim()
+                    containerType = if (body.contains("[") && body.contains("]")) {
+                        body.substringAfterLast("[").substringBefore("]").trim().ifBlank { "APK/JAR" }
+                    } else "APK/JAR"
+                    classes.clear(); methods.clear(); strings.clear()
+                    resolvedKeys.clear(); traces.clear(); outline.clear(); inOutline = false
                 }
+                t.startsWith("RES_KEY:") -> resolvedKeys += t.removePrefix("RES_KEY:").trim()
+                t.startsWith("TRACE_METHOD:") -> {
+                    flushTrace()
+                    curTraceMethod = t.removePrefix("TRACE_METHOD:").trim()
+                }
+                t.startsWith("TRACE_RES:") -> curTraceRes += t.removePrefix("TRACE_RES:").trim()
+                t.startsWith("TRACE_CALL:") -> curTraceCalls += t.removePrefix("TRACE_CALL:").trim()
+                t.startsWith("TRACE_STR:") -> curTraceStrs += t.removePrefix("TRACE_STR:").trim()
                 t.startsWith("CLASS:") -> classes += t.removePrefix("CLASS:").trim()
                 t.startsWith("METHOD:") -> methods += t.removePrefix("METHOD:").trim()
                 t.startsWith("STRING:") -> strings += t.removePrefix("STRING:").trim()
@@ -1484,6 +1589,73 @@ object PortAnalysisEngine {
         }
         flush()
         return out
+    }
+
+    private fun resolveZipCausalChain(
+        zip: RawZipArchiveBundle,
+        parsedOverlays: List<OverlayDeepInspection>,
+        language: AppLanguage
+    ): List<CausalChainLink> {
+        val rep = zip.report
+        if (rep != null && rep.causalChain.isNotEmpty()) return rep.causalChain
+
+        val dexExtracts = loadDexSourceExtracts(zip)
+        val binderRaw = readRaw(zip, "raw/binder_trace_delta.txt")
+        val binderTraces = rep?.binderTraces?.takeIf { it.isNotEmpty() }
+            ?: SystemProbeCollector.parseBinderTraceText(binderRaw)
+        val sfDelta = readRaw(zip, "raw/surfaceflinger_live_delta.txt")
+        val dmesgDelta = readRaw(zip, "raw/dmesg_delta.txt")
+        val silentStall = rep?.sessionFlow?.any { it.id == "evt_silent_hal_stall" } == true
+
+        return PatchAndArchitectureAnalyzer.buildCausalChainFromModel(
+            rootGranted = rep?.environment?.rootGranted ?: (binderRaw.isNotBlank() || dmesgDelta.isNotBlank()),
+            overlayInspections = parsedOverlays,
+            dexExtracts = dexExtracts,
+            binderTraces = binderTraces,
+            procLiveMaps = rep?.procLiveMaps.orEmpty(),
+            elfAnalyses = rep?.elfAnalyses.orEmpty(),
+            sysfsTransitions = rep?.sysfsTransitions.orEmpty(),
+            fingerDownChain = rep?.fingerDownChain.orEmpty(),
+            dumpsysFingerprint = readRaw(zip, "raw/dumpsys_fingerprint.txt"),
+            dumpsysBiometric = readRaw(zip, "raw/dumpsys_biometric.txt"),
+            dumpsysSurfaceFlinger = readRaw(zip, "raw/dumpsys_surfaceflinger.txt"),
+            surfaceFlingerLiveDelta = sfDelta,
+            dmesgDelta = dmesgDelta,
+            lshalOutput = readRaw(zip, "raw/lshal.txt"),
+            serviceList = readRaw(zip, "raw/service_list.txt"),
+            silentHalStall = silentStall,
+            language = language
+        )
+    }
+
+    private fun computeCausalBreakSummary(
+        romChain: List<CausalChainLink>,
+        gsiChain: List<CausalChainLink>,
+        language: AppLanguage
+    ): String {
+        if (romChain.isEmpty()) return ""
+        val firstBreak = romChain.indices.firstNotNullOfOrNull { idx ->
+            val r = romChain[idx]
+            val g = gsiChain.getOrNull(idx)
+            val rOk = r.status == EvidenceStatus.CONFIRMED || r.status == EvidenceStatus.OBSERVED
+            val gBad = g == null || g.status == EvidenceStatus.FAILED || g.status == EvidenceStatus.SUSPECT ||
+                (r.status == EvidenceStatus.CONFIRMED && g.status == EvidenceStatus.UNKNOWN)
+            if (rOk && gBad) r to g else null
+        }
+        return if (firstBreak != null) {
+            val (r, g) = firstBreak
+            if (language == AppLanguage.FR) {
+                "Rupture causale au niveau [${r.title}] : ROM=${r.status} (${r.sourceFile}) vs GSI=${g?.status ?: "UNKNOWN"} ${g?.breakExplanation?.takeIf { it.isNotBlank() }?.let { "→ $it" }.orEmpty()}"
+            } else {
+                "Causal break at [${r.title}]: ROM=${r.status} (${r.sourceFile}) vs GSI=${g?.status ?: "UNKNOWN"} ${g?.breakExplanation?.takeIf { it.isNotBlank() }?.let { "→ $it" }.orEmpty()}"
+            }
+        } else {
+            if (language == AppLanguage.FR) {
+                "Différentiel multi-couches capturé sans rupture unique isolée (vérifier logs DEX/Binder ci-dessous)."
+            } else {
+                "Multi-layer divergence captured (inspect DEX/Binder layers below)."
+            }
+        }
     }
 
     private fun loadFileProvenance(zip: RawZipArchiveBundle): List<FileProvenanceArtifact> {

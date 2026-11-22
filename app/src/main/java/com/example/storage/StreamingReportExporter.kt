@@ -110,6 +110,7 @@ object StreamingReportExporter {
                 writeRawEntry(zip, "raw/file_provenance_index.txt", report.rawArtifacts.fileProvenanceIndex)
                 writeRawEntry(zip, "raw/proc_live_maps.txt", report.rawArtifacts.procLiveMaps)
                 writeRawEntry(zip, "raw/dex_source_extract.txt", report.rawArtifacts.dexSourceExtract)
+                writeRawEntry(zip, "raw/binder_trace_delta.txt", report.rawArtifacts.binderTraceDelta)
             }
         }
         label
@@ -296,6 +297,26 @@ object StreamingReportExporter {
             w.appendLine()
         }
 
+        if (r.causalChain.isNotEmpty()) {
+            w.appendLine("## 0c. END-TO-END CAUSAL FOD CHAIN (${r.causalChain.size} layers | ${r.filteredNonFodOverlayCount} non-FOD RROs filtered)")
+            r.causalChain.forEach { link ->
+                w.appendLine("- **[${link.status}] ${link.title}** (`${link.proofKind}`) · `${link.sourceFile}`")
+                if (link.referencedResourceKeys.isNotEmpty()) {
+                    w.appendLine("  - Keys/Symbols: `${link.referencedResourceKeys.joinToString(", ")}`")
+                }
+                if (link.liveRuntimeEvidence.isNotBlank()) {
+                    w.appendLine("  - Live: `${link.liveRuntimeEvidence.replace("\n", " | ")}`")
+                }
+                if (link.breakExplanation.isNotBlank()) {
+                    w.appendLine("  - Break: ${link.breakExplanation}")
+                }
+                if (link.codeExcerpt.isNotBlank()) {
+                    w.appendLine("  ```text\n${link.codeExcerpt}\n  ```")
+                }
+            }
+            w.appendLine()
+        }
+
         w.appendLine("## 1. SESSION FLOW (${r.sessionFlow.size} events)")
         r.sessionFlow.forEach { e ->
             w.appendLine("- [${e.status} | ${e.knowledgeLevel}] `${e.timestamp}` **${e.phase}** (${e.component}) benign=${e.isBenignWarning} blocking=${e.isBlockingFailure}")
@@ -343,9 +364,15 @@ object StreamingReportExporter {
         }
 
         if (r.dexSourceExtracts.isNotEmpty()) {
-            w.appendLine("## 5c. DEX SOURCE-LEVEL EXTRACTS (${r.dexSourceExtracts.size})")
+            w.appendLine("## 5c. DEX SOURCE-LEVEL & BYTECODE EXTRACTS (${r.dexSourceExtracts.size})")
             r.dexSourceExtracts.forEach { dex ->
-                w.appendLine("### `${dex.archivePath}` (${dex.targetHint})")
+                w.appendLine("### `${dex.archivePath}` (${dex.targetHint}) [${dex.containerType}]")
+                if (dex.resolvedResourceKeys.isNotEmpty()) {
+                    w.appendLine("- Resolved Resource Keys: `${dex.resolvedResourceKeys.joinToString(", ")}`")
+                }
+                dex.methodTraces.take(15).forEach { tr ->
+                    w.appendLine("- Trace `${tr.fqMethod}` → calls: `${tr.invokedMethods.take(6).joinToString(", ")}` | res: `${tr.resolvedResKeys.joinToString(", ")}`")
+                }
                 w.appendLine("```kotlin")
                 w.appendLine(dex.sourcePseudoSummary)
                 w.appendLine("```")
@@ -353,11 +380,12 @@ object StreamingReportExporter {
             w.appendLine()
         }
 
-        val scoredOverlays = r.overlayInspections.filter { it.fodRelevanceScore > 0 || it.decodedArscEntries.isNotEmpty() || it.pseudoXmlSource.isNotBlank() }
-        if (scoredOverlays.isNotEmpty()) {
-            w.appendLine("## 5d. CONTENT-SCORED OVERLAY DECODED ARSC & PSEUDO-XML (${scoredOverlays.size})")
+        val scoredOverlays = r.overlayInspections.filter { it.isStrictProvenFod || it.fodRelevanceScore > 0 || it.decodedArscEntries.isNotEmpty() || it.pseudoXmlSource.isNotBlank() }
+        if (scoredOverlays.isNotEmpty() || r.filteredNonFodOverlayCount > 0) {
+            w.appendLine("## 5d. STRICT PROVEN FOD RRO OVERLAYS (${scoredOverlays.size} proven · ${r.filteredNonFodOverlayCount} non-FOD filtered)")
             scoredOverlays.take(20).forEach { ov ->
-                w.appendLine("### `${ov.packageName}` (score=${ov.fodRelevanceScore}, live=${ov.provenInLiveMaps}, apk=`${ov.apkPath}`)")
+                w.appendLine("### `${ov.packageName}` (strict=${ov.isStrictProvenFod}, score=${ov.fodRelevanceScore}, live=${ov.provenInLiveMaps}, apk=`${ov.apkPath}`)")
+                ov.bytecodeMatchedResourceKeys.forEach { w.appendLine("- BYTECODE_R_ID_MATCH: `$it`") }
                 if (ov.lookupWinners.isNotEmpty()) {
                     ov.lookupWinners.forEach { w.appendLine("- LOOKUP_WINNER: `$it`") }
                 }
@@ -367,6 +395,16 @@ object StreamingReportExporter {
                     w.appendLine(ov.pseudoXmlSource)
                     w.appendLine("```")
                 }
+            }
+            w.appendLine()
+        }
+
+        if (r.binderTraces.isNotEmpty()) {
+            w.appendLine("## 5e. BINDER TRANSACTIONS & HAL IPC LINKS (${r.binderTraces.size})")
+            r.binderTraces.forEach { bt ->
+                w.appendLine("- **${bt.processName}** (pid=${bt.pid}): nodes=${bt.incomingNodes}, refs=${bt.outgoingRefs}")
+                bt.linkedPeerProcesses.take(10).forEach { w.appendLine("  - PEER: `$it`") }
+                bt.activeTransactions.take(10).forEach { w.appendLine("  - TX: `$it`") }
             }
             w.appendLine()
         }
@@ -392,6 +430,7 @@ object StreamingReportExporter {
             "file_provenance_index" to r.rawArtifacts.fileProvenanceIndex,
             "proc_live_maps" to r.rawArtifacts.procLiveMaps,
             "dex_source_extract" to r.rawArtifacts.dexSourceExtract,
+            "binder_trace_delta" to r.rawArtifacts.binderTraceDelta,
             "getprop_all" to r.rawArtifacts.getpropAll
         )
         rawBlocks.forEach { (title, body) ->
@@ -468,12 +507,23 @@ object StreamingReportExporter {
             }
             w.appendLine("</ul>")
         }
+        if (r.causalChain.isNotEmpty()) {
+            w.appendLine("<h2>END-TO-END CAUSAL FOD CHAIN (${r.causalChain.size} layers · ${r.filteredNonFodOverlayCount} non-FOD overlays filtered)</h2><ul>")
+            r.causalChain.forEach { link ->
+                w.appendLine("<li><b>[${link.status}] ${esc(link.title)}</b> (${esc(link.proofKind)}) — <code>${esc(link.sourceFile)}</code>")
+                if (link.breakExplanation.isNotBlank()) w.appendLine("<br/><i>${esc(link.breakExplanation)}</i>")
+                if (link.codeExcerpt.isNotBlank()) w.appendLine("<pre>${esc(link.codeExcerpt)}</pre>")
+                w.appendLine("</li>")
+            }
+            w.appendLine("</ul>")
+        }
         writeHtmlDetails(w, "RAW: dmesg_delta", r.rawArtifacts.dmesgDelta)
         writeHtmlDetails(w, "RAW: surfaceflinger_live_delta", r.rawArtifacts.surfaceFlingerLiveDelta)
         writeHtmlDetails(w, "RAW: overlay_deep_inspect", r.rawArtifacts.overlayDeepInspect)
         writeHtmlDetails(w, "RAW: file_provenance_index", r.rawArtifacts.fileProvenanceIndex)
         writeHtmlDetails(w, "RAW: proc_live_maps", r.rawArtifacts.procLiveMaps)
         writeHtmlDetails(w, "RAW: dex_source_extract", r.rawArtifacts.dexSourceExtract)
+        writeHtmlDetails(w, "RAW: binder_trace_delta", r.rawArtifacts.binderTraceDelta)
         writeHtmlDetails(w, "RAW: getprop_all", r.rawArtifacts.getpropAll)
         w.appendLine("</body></html>")
     }
@@ -589,7 +639,24 @@ object StreamingReportExporter {
         w.appendLine()
         w.appendLine("## 1. Factual Root-Cause Verdict")
         w.appendLine(p.factualRootCauseVerdict)
+        if (p.causalBreakSummary.isNotBlank()) {
+            w.appendLine("- **Causal Break**: ${p.causalBreakSummary}")
+        }
+        if (p.filteredNonFodOverlayCount > 0) {
+            w.appendLine("- **Non-FOD Overlays Rejected**: ${p.filteredNonFodOverlayCount}")
+        }
         w.appendLine()
+        if (p.romCausalChain.isNotEmpty()) {
+            w.appendLine("## 1b. Causal Chain Comparison (ROM vs GSI)")
+            p.romCausalChain.forEachIndexed { idx, rLink ->
+                val gLink = p.gsiCausalChain.getOrNull(idx)
+                w.appendLine("- **${rLink.title}**: ROM=`${rLink.status}` (${rLink.sourceFile}) vs GSI=`${gLink?.status ?: "UNKNOWN"}` (${gLink?.sourceFile ?: "?"})")
+                if (gLink != null && gLink.breakExplanation.isNotBlank()) {
+                    w.appendLine("  - GSI Break: ${gLink.breakExplanation}")
+                }
+            }
+            w.appendLine()
+        }
         if (p.aiFactualSynthesis.isNotBlank()) {
             w.appendLine("## 2. 100% Factual AI & Porting Synthesis")
             w.appendLine(p.aiFactualSynthesis)
@@ -682,8 +749,20 @@ object StreamingReportExporter {
         w.appendLine("<p><b>GSI Archive:</b> ${esc(p.gsiSourceName)} (${p.gsiFilesRead} files, ${p.gsiTotalBytes / 1024} KB)</p>")
         w.appendLine("<p><b>Boot/Vendor Parity:</b> ${p.bootVendorParityVerified} — <code>${esc(p.bootVendorParitySummary)}</code></p>")
         w.appendLine("<p><b>AI Engine:</b> <span class='badge'>${esc(p.aiProviderUsed.ifBlank { "Local Forensic Engine" })}</span></p>")
+        if (p.causalBreakSummary.isNotBlank()) {
+            w.appendLine("<p><b>Causal Break:</b> ${esc(p.causalBreakSummary)} (${p.filteredNonFodOverlayCount} non-FOD RROs rejected)</p>")
+        }
         w.appendLine("<pre>${esc(p.factualRootCauseVerdict)}</pre>")
         w.appendLine("</div>")
+
+        if (p.romCausalChain.isNotEmpty()) {
+            w.appendLine("<h2>Causal Chain Comparison (ROM vs GSI)</h2><ul>")
+            p.romCausalChain.forEachIndexed { idx, rLink ->
+                val gLink = p.gsiCausalChain.getOrNull(idx)
+                w.appendLine("<li><b>${esc(rLink.title)}</b>: ROM=[${rLink.status}] (<code>${esc(rLink.sourceFile)}</code>) vs GSI=[${gLink?.status ?: "UNKNOWN"}] (<code>${esc(gLink?.sourceFile ?: "?")}</code>)</li>")
+            }
+            w.appendLine("</ul>")
+        }
 
         if (p.aiFactualSynthesis.isNotBlank()) {
             w.appendLine("<h2>100% Factual AI &amp; Porting Synthesis</h2><pre>${esc(p.aiFactualSynthesis)}</pre>")
