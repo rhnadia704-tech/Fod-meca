@@ -14,6 +14,12 @@ import java.util.Locale
 
 object FodComparatorEngine {
 
+    private val normBrightnessRegex = Regex("Brightness=[0-9.E-]+", RegexOption.IGNORE_CASE)
+    private val normSdrBrightnessRegex = Regex("SdrBrightness=[0-9.E-]+", RegexOption.IGNORE_CASE)
+    private val normStablePhysicalRegex = Regex("address StablePhysical\\{[^}]+\\}", RegexOption.IGNORE_CASE)
+    private val normManufactureDateRegex = Regex("ManufactureDate\\{[^}]+\\}", RegexOption.IGNORE_CASE)
+    private val normFrameRateOverrideRegex = Regex("frameRateOverride[^,|]*", RegexOption.IGNORE_CASE)
+
     fun compare(
         rom: FodDiagnosticReport,
         gsi: FodDiagnosticReport,
@@ -423,11 +429,11 @@ object FodComparatorEngine {
 
     private fun normalizeMetadataForComparison(meta: Map<String, String>): Map<String, String> =
         meta.mapValues { (_, v) ->
-            v.replace(Regex("Brightness=[0-9.E-]+", RegexOption.IGNORE_CASE), "Brightness=<norm>")
-                .replace(Regex("SdrBrightness=[0-9.E-]+", RegexOption.IGNORE_CASE), "SdrBrightness=<norm>")
-                .replace(Regex("address StablePhysical\\{[^}]+}", RegexOption.IGNORE_CASE), "address=<norm>")
-                .replace(Regex("ManufactureDate\\{[^}]+}", RegexOption.IGNORE_CASE), "ManufactureDate=<norm>")
-                .replace(Regex("frameRateOverride[^,|]*", RegexOption.IGNORE_CASE), "")
+            v.replace(normBrightnessRegex, "Brightness=<norm>")
+                .replace(normSdrBrightnessRegex, "SdrBrightness=<norm>")
+                .replace(normStablePhysicalRegex, "address=<norm>")
+                .replace(normManufactureDateRegex, "ManufactureDate=<norm>")
+                .replace(normFrameRateOverrideRegex, "")
                 .trim()
         }
 

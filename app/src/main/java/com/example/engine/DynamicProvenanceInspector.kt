@@ -309,7 +309,7 @@ object DynamicProvenanceInspector {
             }
         }
 
-        val headerRegex = Regex("^([a-zA-Z0-9._-]+):\\d+\\s*\\{?$|^Package \\[([a-zA-Z0-9._-]+)]|^([a-zA-Z0-9._-]+)\\s*\\{?$")
+        val headerRegex = Regex("^([a-zA-Z0-9._-]+):\\d+\\s*\\{?$|^Package \\[([a-zA-Z0-9._-]+)\\]|^([a-zA-Z0-9._-]+)\\s*\\{?$")
         for (line in raw.lineSequence()) {
             val t = line.trim()
             val headerMatch = headerRegex.matchEntire(t)

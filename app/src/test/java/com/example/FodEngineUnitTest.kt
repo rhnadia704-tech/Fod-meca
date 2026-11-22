@@ -580,5 +580,67 @@ class FodEngineUnitTest {
         assertTrue(mdStr.contains("/product/overlay/SpoonOverlay2025/SpoonOverlay2025.apk"))
         assertTrue(mdStr.contains("/product/overlay/SpoonOverlay2025"))
     }
+
+    @Test
+    fun comparatorEngine_normalizesDisplayDeviceInfoMetadataWithoutRegexErrors() {
+        val env = sampleEnv(isGsi = false)
+        val romDisplayComp = DiscoveredComponent(
+            id = "disp_0",
+            name = "DisplayEngine",
+            category = ComponentCategory.DISPLAY_PIPELINE,
+            version = "active",
+            interfaceType = "DisplayManager",
+            path = "/dev/dri",
+            status = EvidenceStatus.CONFIRMED,
+            knowledgeLevel = KnowledgeLevel.FACT,
+            metadata = mapOf(
+                "info" to "Brightness=5.1148894E-4 | SdrBrightness=5.1148894E-4 | address StablePhysical{id=4630947119594951809, port=129}, ManufactureDate{week=27, year=2006}, frameRateOverride , supportedColorModes [0, 7, 9]"
+            )
+        )
+        val gsiDisplayComp = romDisplayComp.copy(
+            metadata = mapOf(
+                "info" to "Brightness=0.029811 | SdrBrightness=0.029811 | address StablePhysical{id=123456, port=1}, ManufactureDate{week=10, year=2025}, frameRateOverride 60.0, supportedColorModes [0, 7, 9]"
+            )
+        )
+        val baseSummary = DiagnosticSummary(
+            overallOutcome = "OK",
+            enrollmentObserved = true,
+            enrollmentSucceeded = true,
+            realSuccessDespiteNoiseNote = "OK",
+            firstDemonstratedBreak = "None",
+            confirmedCount = 1,
+            observedCount = 0,
+            suspectCount = 0,
+            failedCount = 0,
+            unknownCount = 0
+        )
+        val rom = FodDiagnosticReport(
+            sessionId = "r1",
+            mode = DiagnosticMode.ROM_FOD,
+            createdAtIso = "2026-11-22T00:00:00Z",
+            enrollmentDurationMs = 4000L,
+            environment = env,
+            sessionFlow = emptyList(),
+            components = listOf(romDisplayComp),
+            dependencyEdges = emptyList(),
+            patches = emptyList(),
+            elfAnalyses = emptyList(),
+            findings = emptyList(),
+            summary = baseSummary,
+            rawArtifacts = RawArtifactsBundle()
+        )
+        val gsi = rom.copy(
+            sessionId = "g1",
+            mode = DiagnosticMode.GSI_FOD,
+            environment = env.copy(isGsiSuspected = true),
+            components = listOf(gsiDisplayComp)
+        )
+
+        val result = FodComparatorEngine.compare(rom, gsi, AppLanguage.FR)
+        assertTrue(result.bootVendorParityVerified)
+        // Differences solely in Brightness / StablePhysical / ManufactureDate / frameRateOverride must normalize to identical!
+        assertFalse(result.commonComponentDiffs.any { it.title == "DisplayEngine" })
+    }
 }
+
 

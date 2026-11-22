@@ -422,7 +422,7 @@ fun PortScreen(
                             }
                         }
                     } else {
-                        items(result.extractableFiles, key = { it.id }) { ex ->
+                        items(result.extractableFiles, key = { "${it.category}::${it.romFilePath}::${it.title}" }) { ex ->
                             ExtractableFileCard(
                                 item = ex,
                                 onCopyPath = { copyPortPathToClipboard(context, it) }
@@ -479,7 +479,7 @@ fun PortScreen(
                             d.gsiEvidence.contains(diffQuery, true)
                         matchStatus && matchQuery
                     }
-                    items(filtered, key = { it.id }) { d ->
+                    items(filtered, key = { "${it.sourceFile}::${it.title}" }) { d ->
                         TelemetrySectionCard {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),

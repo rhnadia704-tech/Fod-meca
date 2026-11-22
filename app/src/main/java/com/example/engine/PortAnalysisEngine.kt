@@ -22,7 +22,10 @@ object PortAnalysisEngine {
         RegexOption.IGNORE_CASE
     )
 
-    private val propLineRegex = Regex("^\\[(.+?)]: \\[(.*)]$")
+    private val propLineRegex = Regex("^\\[(.+?)\\]: \\[(.*)\\]$")
+    private val avcPermRegex = Regex("\\{[^}]+\\}")
+    private val avcTclassRegex = Regex("tclass=\\S+")
+    private val avcScontextRegex = Regex("scontext=u:r:([^:]+):")
 
     fun analyze(
         romZip: RawZipArchiveBundle,
@@ -1335,9 +1338,9 @@ object PortAnalysisEngine {
             .toList()
 
     private fun normalizeAvc(line: String): String {
-        val perm = Regex("\\{[^}]+}").find(line)?.value.orEmpty()
-        val tclass = Regex("tclass=\\S+").find(line)?.value.orEmpty()
-        val scontext = Regex("scontext=u:r:([^:]+):").find(line)?.groupValues?.get(1).orEmpty()
+        val perm = avcPermRegex.find(line)?.value.orEmpty()
+        val tclass = avcTclassRegex.find(line)?.value.orEmpty()
+        val scontext = avcScontextRegex.find(line)?.groupValues?.get(1).orEmpty()
         return "$scontext::$perm::$tclass"
     }
 }

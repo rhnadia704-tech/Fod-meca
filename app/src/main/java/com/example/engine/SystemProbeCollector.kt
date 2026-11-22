@@ -712,7 +712,7 @@ class SystemProbeCollector(private val context: Context) {
 
     private fun parseProperties(raw: String): Map<String, String> {
         val map = LinkedHashMap<String, String>()
-        val regex = Regex("^\\[(.+?)]: \\[(.*)]$")
+        val regex = Regex("^\\[(.+?)\\]: \\[(.*)\\]$")
         for (line in raw.lineSequence()) {
             val m = regex.matchEntire(line.trim()) ?: continue
             map[m.groupValues[1]] = m.groupValues[2]

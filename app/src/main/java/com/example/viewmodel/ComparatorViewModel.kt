@@ -14,10 +14,12 @@ import com.example.model.FodDiagnosticReport
 import com.example.storage.LocalSessionRepository
 import com.example.storage.StreamingReportExporter
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val TAG = "ComparatorViewModel"
 
@@ -81,9 +83,21 @@ class ComparatorViewModel(application: Application) : AndroidViewModel(applicati
     fun runComparison(language: AppLanguage) {
         val rom = _romReport.value ?: return
         val gsi = _gsiReport.value ?: return
-        val diff = FodComparatorEngine.compare(rom, gsi, language)
-        _comparisonResult.value = diff
-        runAiComparisonSynthesis(diff, rom, gsi, language)
+        viewModelScope.launch {
+            _importError.value = null
+            try {
+                val diff = withContext(Dispatchers.Default) {
+                    FodComparatorEngine.compare(rom, gsi, language)
+                }
+                _comparisonResult.value = diff
+                runAiComparisonSynthesis(diff, rom, gsi, language)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Comparison failed", e)
+                _importError.value = e.localizedMessage ?: "Comparison failed"
+            }
+        }
     }
 
     fun runAiComparisonSynthesis(
