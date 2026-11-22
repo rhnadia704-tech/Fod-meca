@@ -51,6 +51,20 @@ data class PortingCandidateSolution(
     val limitations: String
 )
 
+data class ExtractableFileItem(
+    val id: String,
+    val category: String,
+    val title: String,
+    val romFilePath: String,
+    val romDirectory: String,
+    val targetGsiPath: String,
+    val importantElements: List<String>,
+    val missingMechanism: String,
+    val gsiCurrentState: String,
+    val priorityPercent: Int,
+    val canExtractWithoutVendorOrBoot: Boolean = true
+)
+
 data class PortAnalysisResult(
     val createdAtIso: String,
     val romSourceName: String,
@@ -66,6 +80,7 @@ data class PortAnalysisResult(
     val filteredSharedNoiseCount: Int,
     val sharedNoiseSamples: List<PortFileDiffItem>,
     val portingSolutions: List<PortingCandidateSolution>,
+    val extractableFiles: List<ExtractableFileItem> = emptyList(),
     val aiProviderUsed: String = "",
     val aiFactualSynthesis: String = ""
 )

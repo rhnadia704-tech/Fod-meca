@@ -1,7 +1,13 @@
 package com.example.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -23,7 +29,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Verified
@@ -52,6 +61,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -60,6 +70,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.i18n.AppLanguage
 import com.example.i18n.LocalAppStrings
 import com.example.model.EvidenceStatus
+import com.example.model.ExtractableFileItem
 import com.example.model.PortingCandidateSolution
 import com.example.model.RawZipArchiveBundle
 import com.example.ui.components.KnowledgeBadge
@@ -77,6 +88,7 @@ fun PortScreen(
     modifier: Modifier = Modifier
 ) {
     val strings = LocalAppStrings.current
+    val context = LocalContext.current
     val statusColors = LocalFodStatusColors.current
 
     val romArchive by viewModel.romArchive.collectAsStateWithLifecycle()
@@ -331,10 +343,11 @@ fun PortScreen(
                 }
             }
 
-            // Sub-Tabs: VERDICT & IA | SOLUTIONS DE PORTAGE | DIFF INTEGRAL ZIP
+            // Sub-Tabs: VERDICT & IA | FICHIERS A EXTRAIRE | SOLUTIONS DE PORTAGE | DIFF INTEGRAL ZIP
             item {
                 val subTabs = listOf(
                     strings.portSubTabVerdict,
+                    "${strings.portSubTabExtractables} (${result.extractableFiles.size})",
                     "${strings.portSubTabSolutions} (${result.portingSolutions.size})",
                     "${strings.portSubTabFileDiffs} (${result.factualDiffs.size})"
                 )
@@ -399,6 +412,26 @@ fun PortScreen(
                 }
 
                 1 -> {
+                    if (result.extractableFiles.isEmpty()) {
+                        item {
+                            TelemetrySectionCard {
+                                Text(
+                                    text = strings.portEmptyBody,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            }
+                        }
+                    } else {
+                        items(result.extractableFiles, key = { it.id }) { ex ->
+                            ExtractableFileCard(
+                                item = ex,
+                                onCopyPath = { copyPortPathToClipboard(context, it) }
+                            )
+                        }
+                    }
+                }
+
+                2 -> {
                     items(result.portingSolutions, key = { it.id }) { sol ->
                         PortSolutionCard(solution = sol)
                     }
@@ -573,4 +606,130 @@ private fun PortSolutionCard(solution: PortingCandidateSolution) {
         }
         Text("Limits: ${solution.limitations}", style = MaterialTheme.typography.labelSmall, color = statusColors.suspect)
     }
+}
+
+@Composable
+private fun ExtractableFileCard(
+    item: ExtractableFileItem,
+    onCopyPath: (String) -> Unit
+) {
+    val strings = LocalAppStrings.current
+    val statusColors = LocalFodStatusColors.current
+    var expanded by rememberSaveable(item.id) { mutableStateOf(item.priorityPercent >= 88) }
+
+    TelemetrySectionCard(
+        borderColor = if (item.priorityPercent >= 88) statusColors.confirmed else MaterialTheme.colorScheme.outline,
+        modifier = Modifier.clickable { expanded = !expanded }
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(item.category, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                Text(item.title, style = MaterialTheme.typography.titleSmall)
+            }
+            Surface(
+                color = statusColors.confirmedContainer,
+                shape = RoundedCornerShape(6.dp)
+            ) {
+                Text(
+                    text = "${item.priorityPercent}%",
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = statusColors.confirmed,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        if (item.canExtractWithoutVendorOrBoot) {
+            Surface(
+                color = statusColors.confirmedContainer,
+                shape = RoundedCornerShape(6.dp)
+            ) {
+                Text(
+                    text = "BOOT & VENDOR INTACTS",
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = statusColors.confirmed,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = item.romFilePath,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = statusColors.confirmed,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "${strings.portSourceDirLabel}: ${item.romDirectory}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "${strings.portTargetGsiLabel}: ${item.targetGsiPath}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+            IconButton(
+                onClick = { onCopyPath(item.romFilePath) },
+                modifier = Modifier
+                    .size(48.dp)
+                    .testTag("copy_extractable_${item.id}")
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.ContentCopy,
+                    contentDescription = strings.portCopyPathLabel,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+
+        Text(item.missingMechanism, style = MaterialTheme.typography.bodySmall)
+        Text("GSI: ${item.gsiCurrentState}", style = MaterialTheme.typography.labelSmall, color = statusColors.failed)
+
+        if (item.importantElements.isNotEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "${strings.portImportantContentsLabel} (${item.importantElements.size})",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Icon(
+                    imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+            AnimatedVisibility(visible = expanded) {
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                    item.importantElements.forEach { line ->
+                        Text("• $line", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun copyPortPathToClipboard(context: Context, path: String) {
+    val cm = context.getSystemService(ClipboardManager::class.java) ?: return
+    cm.setPrimaryClip(ClipData.newPlainText("FOD Path", path))
+    Toast.makeText(context, path, Toast.LENGTH_SHORT).show()
 }

@@ -1,8 +1,11 @@
 package com.example.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -34,7 +37,10 @@ import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Memory
@@ -55,6 +61,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -577,7 +584,10 @@ fun DiagnosticScreen(
                         matchesStatus && matchesQuery
                     }
                     items(filteredComponents, key = { it.id }) { comp ->
-                        TelemetrySectionCard {
+                        var expandedComp by remember { mutableStateOf(false) }
+                        TelemetrySectionCard(
+                            modifier = Modifier.clickable(enabled = comp.metadata.isNotEmpty()) { expandedComp = !expandedComp }
+                        ) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -591,7 +601,30 @@ fun DiagnosticScreen(
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.primary
                             )
-                            Text(comp.path, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = comp.path,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (comp.path.startsWith("/")) {
+                                    IconButton(
+                                        onClick = { copyPathToClipboard(context, comp.path) },
+                                        modifier = Modifier.size(48.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.ContentCopy,
+                                            contentDescription = strings.portCopyPathLabel,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+                            }
                             if (comp.dependencies.isNotEmpty()) {
                                 Text(
                                     text = "Deps: ${comp.dependencies.joinToString(", ")}",
@@ -604,6 +637,125 @@ fun DiagnosticScreen(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = LocalFodStatusColors.current.suspect
                                 )
+                            }
+                            AnimatedVisibility(visible = expandedComp && comp.metadata.isNotEmpty()) {
+                                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                    comp.metadata.forEach { (k, v) ->
+                                        Text(
+                                            text = "$k: $v",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Deep Overlay & Dynamic File Provenance Section
+                    if (report.overlayInspections.isNotEmpty() || report.fileProvenance.isNotEmpty()) {
+                        item {
+                            Text(
+                                text = "${strings.provenanceDiagnosticTitle} (${report.overlayInspections.size} RRO · ${report.fileProvenance.size} files)",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                        items(report.overlayInspections, key = { "ov_insp_${it.packageName}" }) { ov ->
+                            var expandedOv by remember { mutableStateOf(false) }
+                            TelemetrySectionCard(
+                                borderColor = if (ov.isEnabled) LocalFodStatusColors.current.confirmed.copy(alpha = 0.6f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+                                modifier = Modifier.clickable { expandedOv = !expandedOv }
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(ov.packageName, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                                    StatusPill(status = if (ov.isEnabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED)
+                                }
+                                Text(
+                                    text = "Target: ${ov.targetPackage.ifBlank { "?" }} · prio=${ov.priority} · static=${ov.isStatic}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("APK: ${ov.apkPath}", style = MaterialTheme.typography.labelSmall)
+                                        Text("Dir: ${ov.directory}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    if (ov.apkPath.startsWith("/")) {
+                                        IconButton(
+                                            onClick = { copyPathToClipboard(context, ov.apkPath) },
+                                            modifier = Modifier.size(48.dp)
+                                        ) {
+                                            Icon(Icons.Filled.ContentCopy, contentDescription = strings.portCopyPathLabel, modifier = Modifier.size(16.dp))
+                                        }
+                                    }
+                                    Icon(
+                                        imageVector = if (expandedOv) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                                AnimatedVisibility(visible = expandedOv) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                        ov.manifestSummary.forEach { m ->
+                                            Text("• $m", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                        ov.fodConfigEntries.forEach { entry ->
+                                            Text("• $entry", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        items(report.fileProvenance.filter { it.category != "OVERLAY_APK" }, key = { "prov_card_${it.id}_${it.filePath}" }) { prov ->
+                            var expandedProv by remember { mutableStateOf(false) }
+                            TelemetrySectionCard(modifier = Modifier.clickable { expandedProv = !expandedProv }) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("[${prov.category}] ${prov.filePath.substringAfterLast('/')}", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                                    Icon(
+                                        imageVector = if (expandedProv) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(prov.filePath, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                        Text("${strings.portSourceDirLabel}: ${prov.directory}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    if (prov.filePath.startsWith("/")) {
+                                        IconButton(
+                                            onClick = { copyPathToClipboard(context, prov.filePath) },
+                                            modifier = Modifier.size(48.dp)
+                                        ) {
+                                            Icon(Icons.Filled.ContentCopy, contentDescription = strings.portCopyPathLabel, modifier = Modifier.size(16.dp))
+                                        }
+                                    }
+                                }
+                                AnimatedVisibility(visible = expandedProv) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                        prov.importantContents.forEach { line ->
+                                            Text("• $line", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -629,6 +781,9 @@ fun DiagnosticScreen(
                             Text("${patch.scope} · ${patch.source}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.secondary)
                             Text("Value: ${patch.rawValue}", style = MaterialTheme.typography.labelSmall)
                             Text(patch.realObservedEffect, style = MaterialTheme.typography.bodySmall)
+                            if (patch.note.isNotBlank() && patch.note != patch.name) {
+                                Text(patch.note, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
                         }
                     }
 
@@ -940,4 +1095,10 @@ private fun openFingerprintEnrollmentSettings(context: Context) {
             return
         }
     }
+}
+
+private fun copyPathToClipboard(context: Context, path: String) {
+    val cm = context.getSystemService(ClipboardManager::class.java) ?: return
+    cm.setPrimaryClip(ClipData.newPlainText("FOD Path", path))
+    Toast.makeText(context, path, Toast.LENGTH_SHORT).show()
 }

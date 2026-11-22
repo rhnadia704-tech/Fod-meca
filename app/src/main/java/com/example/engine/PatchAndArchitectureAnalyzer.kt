@@ -345,10 +345,14 @@ object PatchAndArchitectureAnalyzer {
                 initRcSnippets = baseline.initRcSnippets,
                 elfDisassemblyFull = fullElfText,
                 dmesgDelta = dmesgDelta,
-                surfaceFlingerLiveDelta = surfaceFlingerLiveDelta
+                surfaceFlingerLiveDelta = surfaceFlingerLiveDelta,
+                overlayDeepInspect = baseline.overlayDeepInspect,
+                fileProvenanceIndex = baseline.fileProvenanceIndex
             ),
             fingerDownChain = finalChain,
-            sysfsTransitions = sysfsTransitions
+            sysfsTransitions = sysfsTransitions,
+            overlayInspections = baseline.overlayInspections,
+            fileProvenance = baseline.fileProvenance
         )
     }
 
@@ -717,20 +721,28 @@ object PatchAndArchitectureAnalyzer {
         patches: MutableList<DetectedPatch>,
         components: MutableList<DiscoveredComponent>
     ) {
+        val overlayByPkg = baseline.overlayInspections.associateBy { it.packageName }
+        val propFiles = baseline.fileProvenance.filter { it.category == "PROP_FILE" }
+
         propMap.entries
             .filter { patchPropRegex.matches(it.key) || it.key.contains("fod", true) || it.key.contains("udfps", true) || it.key.contains("phh", true) }
             .forEachIndexed { idx, (k, v) ->
                 val isPhhOrGsi = k.contains("phh", true) || k.contains("treble", true) || k.contains("sys.fod", true)
+                val originProp = propFiles.firstOrNull { pf ->
+                    pf.importantContents.any { line -> line.startsWith("$k=") || line.contains("[$k]") || line.contains(k) }
+                }
+                val resolvedSource = originProp?.filePath ?: "SystemProperties (runtime/default)"
+                val resolvedDir = originProp?.directory ?: "runtime"
                 patches += DetectedPatch(
                     id = "patch_prop_$idx",
                     name = k,
-                    source = "SystemProperties (getprop)",
+                    source = "SystemProperties ($resolvedSource)",
                     scope = if (isPhhOrGsi) "GSI / Treble Patch Prop" else "Device / Vendor Prop",
-                    target = k,
+                    target = resolvedSource,
                     rawValue = v,
                     status = EvidenceStatus.CONFIRMED,
                     realObservedEffect = "Pending live trace correlation",
-                    note = "Detected active property [$k]=[$v]"
+                    note = "Prop [$k]=[$v] | File=$resolvedSource | Dir=$resolvedDir"
                 )
                 components += DiscoveredComponent(
                     id = "prop_$idx",
@@ -738,59 +750,122 @@ object PatchAndArchitectureAnalyzer {
                     category = if (isPhhOrGsi) ComponentCategory.PATCH else ComponentCategory.PROPERTY,
                     version = v.ifBlank { "<empty>" },
                     interfaceType = "SystemProperty",
-                    path = k,
+                    path = if (originProp != null) "${originProp.filePath} ($k)" else k,
                     status = EvidenceStatus.CONFIRMED,
-                    knowledgeLevel = KnowledgeLevel.FACT
+                    knowledgeLevel = KnowledgeLevel.FACT,
+                    metadata = buildMap {
+                        if (originProp != null) {
+                            put("file", originProp.filePath)
+                            put("directory", originProp.directory)
+                        }
+                        put("value", v.take(120))
+                    }
                 )
             }
 
+        val seenOverlayPkgs = linkedSetOf<String>()
         baseline.dumpsysOverlay.lineSequence()
             .filter {
                 val l = it.lowercase()
                 l.contains("fod") || l.contains("udfps") || l.contains("treble") ||
-                    l.contains("fingerprint") || l.contains("biometric") || l.contains("systemui")
+                    l.contains("fingerprint") || l.contains("biometric") || l.contains("systemui") ||
+                    l.contains("overlay")
             }
             .distinct()
-            .take(50)
+            .take(60)
             .forEachIndexed { idx, line ->
                 val trimmed = line.trim()
                 val enabled = trimmed.startsWith("[x]", true) || trimmed.contains("STATE_ENABLED")
-                val pkg = trimmed.removePrefix("[x]").removePrefix("[ ]").trim()
+                val pkg = trimmed.removePrefix("[x]").removePrefix("[ ]").trim().substringBefore(" ")
+                if (pkg.isBlank()) return@forEachIndexed
+                seenOverlayPkgs += pkg
+                val deep = overlayByPkg[pkg]
+                val resolvedApk = deep?.apkPath?.takeIf { it != "UNKNOWN" } ?: pkg
+                val resolvedDir = deep?.directory?.takeIf { it != "UNKNOWN" } ?: "UNKNOWN"
+                val keyEntriesPreview = deep?.fodConfigEntries?.take(5)?.joinToString(" ; ").orEmpty()
                 patches += DetectedPatch(
                     id = "patch_rro_$idx",
                     name = pkg,
-                    source = "OverlayManager (cmd overlay list)",
+                    source = if (deep != null && deep.apkPath != "UNKNOWN") "OverlayManager (${deep.apkPath})" else "OverlayManager (cmd overlay list)",
                     scope = "RRO Overlay",
-                    target = pkg,
+                    target = deep?.targetPackage?.takeIf { it.isNotBlank() } ?: pkg,
                     rawValue = if (enabled) "ENABLED" else "DISABLED/STATE_OTHER",
                     status = if (enabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
                     realObservedEffect = if (enabled) "Active RRO overlay" else "Present but inactive",
-                    note = trimmed
+                    note = buildString {
+                        append(trimmed)
+                        if (deep != null) {
+                            append(" | APK=${deep.apkPath} | Dir=$resolvedDir | target=${deep.targetPackage} | prio=${deep.priority}")
+                            if (keyEntriesPreview.isNotBlank()) append(" | Keys: $keyEntriesPreview")
+                        }
+                    }
                 )
                 components += DiscoveredComponent(
-                    id = "overlay_$idx",
+                    id = "overlay_${idx}_${pkg.hashCode()}",
                     name = pkg,
                     category = ComponentCategory.OVERLAY,
                     version = if (enabled) "ENABLED" else "INACTIVE",
-                    interfaceType = "RRO",
-                    path = pkg,
+                    interfaceType = if (deep?.targetPackage?.isNotBlank() == true) "RRO -> ${deep.targetPackage}" else "RRO",
+                    path = resolvedApk,
                     status = if (enabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
-                    knowledgeLevel = KnowledgeLevel.FACT
+                    knowledgeLevel = KnowledgeLevel.FACT,
+                    metadata = buildMap {
+                        put("apkPath", deep?.apkPath ?: "UNKNOWN")
+                        put("directory", resolvedDir)
+                        if (deep != null && deep.targetPackage.isNotBlank()) put("targetPackage", deep.targetPackage)
+                        if (deep != null) put("priority", deep.priority.toString())
+                        if (keyEntriesPreview.isNotBlank()) put("internalKeys", keyEntriesPreview.take(220))
+                    }
                 )
             }
 
+        // Also include deep-inspected overlays discovered via dumpsys overlay / partitions that weren't in cmd overlay list lines
+        baseline.overlayInspections.filter { it.packageName !in seenOverlayPkgs }.forEachIndexed { idx, deep ->
+            seenOverlayPkgs += deep.packageName
+            val keyEntriesPreview = deep.fodConfigEntries.take(5).joinToString(" ; ")
+            patches += DetectedPatch(
+                id = "patch_rro_deep_$idx",
+                name = deep.packageName,
+                source = "OverlayManager (${deep.apkPath})",
+                scope = "RRO Overlay",
+                target = deep.targetPackage.ifBlank { deep.packageName },
+                rawValue = if (deep.isEnabled) "ENABLED" else "DISABLED/STATE_OTHER",
+                status = if (deep.isEnabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
+                realObservedEffect = if (deep.isEnabled) "Active RRO overlay" else "Present but inactive",
+                note = "APK=${deep.apkPath} | Dir=${deep.directory} | target=${deep.targetPackage} | Keys: $keyEntriesPreview"
+            )
+            components += DiscoveredComponent(
+                id = "overlay_deep_${idx}_${deep.packageName.hashCode()}",
+                name = deep.packageName,
+                category = ComponentCategory.OVERLAY,
+                version = if (deep.isEnabled) "ENABLED" else "INACTIVE",
+                interfaceType = if (deep.targetPackage.isNotBlank()) "RRO -> ${deep.targetPackage}" else "RRO",
+                path = deep.apkPath.takeIf { it != "UNKNOWN" } ?: deep.packageName,
+                status = if (deep.isEnabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
+                knowledgeLevel = KnowledgeLevel.FACT,
+                metadata = buildMap {
+                    put("apkPath", deep.apkPath)
+                    put("directory", deep.directory)
+                    if (deep.targetPackage.isNotBlank()) put("targetPackage", deep.targetPackage)
+                    put("priority", deep.priority.toString())
+                    if (keyEntriesPreview.isNotBlank()) put("internalKeys", keyEntriesPreview.take(220))
+                }
+            )
+        }
+
         baseline.installedOverlayPackages.forEachIndexed { idx, pkg ->
             if (patches.none { it.name.contains(pkg) }) {
+                val deep = overlayByPkg[pkg]
                 patches += DetectedPatch(
                     id = "patch_pkg_$idx",
                     name = pkg,
-                    source = "PackageManager",
+                    source = "PackageManager (${deep?.apkPath ?: "installed"})",
                     scope = "Installed Overlay/FOD Package",
-                    target = pkg,
+                    target = deep?.targetPackage?.ifBlank { pkg } ?: pkg,
                     rawValue = "INSTALLED",
                     status = EvidenceStatus.OBSERVED,
                     realObservedEffect = "Installed package (activation state from OverlayManager if accessible)",
-                    note = pkg
+                    note = "$pkg | APK=${deep?.apkPath ?: "UNKNOWN"} | Dir=${deep?.directory ?: "UNKNOWN"}"
                 )
             }
         }
@@ -799,16 +874,49 @@ object PatchAndArchitectureAnalyzer {
             .filter { it.isNotBlank() }
             .take(40)
             .forEachIndexed { idx, line ->
+                val rcFile = line.substringBefore(":")
                 patches += DetectedPatch(
                     id = "patch_init_$idx",
-                    name = line.substringBefore(":"),
-                    source = "init.rc",
+                    name = rcFile,
+                    source = "init.rc ($rcFile)",
                     scope = "Init Boot/Trigger Script",
-                    target = line.substringBefore(":"),
+                    target = rcFile,
                     rawValue = line.substringAfter(":").trim(),
                     status = EvidenceStatus.OBSERVED,
                     realObservedEffect = "Init trigger definition",
-                    note = line.take(180)
+                    note = "Dir=${rcFile.substringBeforeLast('/', "UNKNOWN")} | ${line.take(180)}"
+                )
+            }
+
+        // Add non-overlay FileProvenanceArtifacts as rich DiscoveredComponents so UI & Comparator inspect exact files/directories
+        baseline.fileProvenance
+            .filter { it.category != "OVERLAY_APK" }
+            .take(60)
+            .forEachIndexed { idx, prov ->
+                val cat = when (prov.category) {
+                    "SELINUX_POLICY" -> ComponentCategory.SELINUX
+                    "PROP_FILE" -> ComponentCategory.PROPERTY
+                    "DISPLAY_CONFIG" -> ComponentCategory.DISPLAY_PIPELINE
+                    "SYSTEMUI_FRAMEWORK" -> ComponentCategory.SERVICE
+                    else -> ComponentCategory.PATCH
+                }
+                components += DiscoveredComponent(
+                    id = "prov_comp_${idx}_${prov.id.hashCode()}",
+                    name = "[${prov.category}] ${prov.filePath.substringAfterLast('/')}",
+                    category = cat,
+                    version = prov.matchedSymbolOrKey.take(60),
+                    interfaceType = prov.category,
+                    path = prov.filePath,
+                    status = EvidenceStatus.CONFIRMED,
+                    knowledgeLevel = KnowledgeLevel.FACT,
+                    metadata = buildMap {
+                        put("directory", prov.directory)
+                        put("filePath", prov.filePath)
+                        if (prov.importantContents.isNotEmpty()) {
+                            put("contents", prov.importantContents.take(5).joinToString(" | ").take(240))
+                        }
+                    },
+                    accessNote = prov.accessNote
                 )
             }
     }
@@ -1075,8 +1183,8 @@ object PatchAndArchitectureAnalyzer {
         findings += InvestigationFinding(
             id = "find_patches",
             title = if (language == AppLanguage.FR) "Inventaire complet des patchs/props/overlays" else "Complete Patch/Prop/Overlay Inventory",
-            detail = "${patches.size} patchs, propriétés et overlays FOD/Treble recensés.",
-            evidenceSnippet = patches.take(5).joinToString(" ; ") { "${it.name}=${it.rawValue}" },
+            detail = "${patches.size} patchs, propriétés et overlays FOD/Treble recensés (${baseline.overlayInspections.size} overlays inspectés, ${baseline.fileProvenance.size} fichiers sources localisés).",
+            evidenceSnippet = patches.take(5).joinToString(" ; ") { "${it.name}=${it.rawValue} [${it.target}]" },
             status = if (patches.isNotEmpty()) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
             knowledgeLevel = KnowledgeLevel.FACT
         )

@@ -112,6 +112,8 @@ object PortZipDeepReader {
             "raw/dmesg_delta.txt" to report.rawArtifacts.dmesgDelta,
             "raw/surfaceflinger_live_delta.txt" to report.rawArtifacts.surfaceFlingerLiveDelta,
             "raw/logcat_enrollment.txt" to report.rawArtifacts.logcatEnrollment,
+            "raw/overlay_deep_inspect.txt" to report.rawArtifacts.overlayDeepInspect,
+            "raw/file_provenance_index.txt" to report.rawArtifacts.fileProvenanceIndex,
             "disassembly/elf_disassembly_full.txt" to report.rawArtifacts.elfDisassemblyFull
         ).filterValues { it.isNotBlank() }
 

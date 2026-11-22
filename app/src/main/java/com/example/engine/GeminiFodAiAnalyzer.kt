@@ -626,21 +626,32 @@ class GeminiFodAiAnalyzer(private val context: Context) {
         val tiersDump = portResult.portingSolutions.joinToString("\n") { s ->
             "- Rank ${s.rank} [${s.confidencePercent}% | SystemUI/FW=${s.requiresFrameworkOrSystemUi}] ${s.title}: ${s.whyItApplies}"
         }
+        val extractablesDump = if (portResult.extractableFiles.isEmpty()) {
+            "(No resolved extractable file provenance entries)"
+        } else {
+            portResult.extractableFiles.joinToString("\n") { ex ->
+                "- [${ex.category} | ${ex.priorityPercent}%] ${ex.title}\n  ROM File: ${ex.romFilePath} (Dir: ${ex.romDirectory})\n  Target GSI: ${ex.targetGsiPath}\n  Missing Mechanism: ${ex.missingMechanism}\n  Important Contents: ${ex.importantElements.take(10).joinToString(" | ")}"
+            }
+        }
 
         return """
             $langInstr
             You are a Principal Android GSI / Treble FOD Reverse Engineer.
-            TASK: Produce a 100% FACTUAL root-cause explanation and exact SYSTEM-SIDE PORTING BLUEPRINT explaining why GSI FOD breaks (e.g., light turns on, zero enroll/error) while Custom ROM works cleanly.
+            TASK: Produce a 100% FACTUAL root-cause explanation, EXACT FILE EXTRACTION LIST (exact partition paths, directories & key internal contents), and exact SYSTEM-SIDE PORTING BLUEPRINT explaining why GSI FOD breaks (e.g., light turns on, zero enroll/error) while Custom ROM works cleanly.
 
             STRICT GROUNDING RULES (100% FACTUAL):
-            1. Cite ONLY exact filenames inside the two ZIPs (e.g. raw/getprop_all.txt, raw/dumpsys_overlay.txt, raw/sysfs_fod_nodes.txt, raw/lshal.txt, disassembly/elf_disassembly_full.txt), exact keys, exact values, and exact log lines observed below.
-            2. ARCHITECTURAL INVARIANT: BOTH ROM and GSI share the EXACT SAME UNTOUCHED `boot` and `vendor` partitions. NEVER propose editing /vendor, vendor HAL binaries, or boot/kernel. Only recommend GSI/system-side solutions (props/PHH -> RRO overlays / system init / system sepolicy -> SystemUI UdfpsController / HBM -> Framework BiometricService / HAL extension).
-            3. Filter out noise: Anything missing or failing identically on BOTH ROM and GSI (or INACTIVE `[ ]` on ROM) is NON-BLOCKING. Explicitly reject false leads.
-            4. Conclude with a ranked recommendation ("MEILLEURE SOLUTION DE PORTAGE") with step-by-step concrete commands/files to adapt on the GSI.
-            5. Label statements with [FACT], [CORRELATION], or [DEDUCTION]. Zero hallucination.
+            1. Cite ONLY exact filenames inside the two ZIPs AND exact Android partition paths/directories from raw/overlay_deep_inspect.txt and raw/file_provenance_index.txt (e.g. /product/overlay/..., /system_ext/priv-app/..., /product/etc/displayconfig/..., /vendor/etc/init/...), exact keys, and exact log lines observed below.
+            2. Explain specifically WHICH concrete file(s) on the Custom ROM contain each missing overlay, property, XML feature, init trigger, or SystemUI/Framework hook, and WHAT important lines/configs are inside them.
+            3. ARCHITECTURAL INVARIANT: BOTH ROM and GSI share the EXACT SAME UNTOUCHED `boot` and `vendor` partitions. NEVER propose editing /vendor, vendor HAL binaries, or boot/kernel. Only recommend GSI/system-side solutions (props/PHH -> RRO overlays / system init / system sepolicy -> SystemUI UdfpsController / HBM -> Framework BiometricService / HAL extension).
+            4. Filter out noise: Ignore DisplayBrightness floats, StablePhysical display addresses, Cutouts, build dates, and anything missing/failing identically on BOTH ROM and GSI (or INACTIVE `[ ]` on ROM). Explicitly reject false leads.
+            5. Conclude with a ranked recommendation ("MEILLEURE SOLUTION DE PORTAGE") with step-by-step concrete extraction/porting commands on the GSI.
+            6. Label statements with [FACT], [CORRELATION], or [DEDUCTION]. Zero hallucination.
 
             VERDICT PRELIMINARY: ${portResult.factualRootCauseVerdict}
             BOOT/VENDOR PARITY: ${portResult.bootVendorParityVerified} -> ${portResult.bootVendorParitySummary}
+
+            EXACT FILES & MECHANISMS TO EXTRACT FROM CUSTOM ROM (${portResult.extractableFiles.size}):
+            $extractablesDump
 
             COMPLETE ROM ZIP INDEX (${romZip.totalFiles} files, ${romZip.totalBytes} B):
             $manifestRom
@@ -693,6 +704,17 @@ class GeminiFodAiAnalyzer(private val context: Context) {
                 }
             }
             appendLine()
+            if (portResult.extractableFiles.isNotEmpty()) {
+                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Fichiers & mécanismes exacts à extraire du Custom ROM (${portResult.extractableFiles.size})" else "Exact Files & Mechanisms to Extract From Custom ROM (${portResult.extractableFiles.size})"}")
+                portResult.extractableFiles.take(15).forEach { ex ->
+                    appendLine("- **[${ex.category} · ${ex.priorityPercent}%] ${ex.title}**")
+                    appendLine("  - ${if (language == AppLanguage.FR) "Fichier ROM" else "ROM File"}: `${ex.romFilePath}` (${if (language == AppLanguage.FR) "Répertoire" else "Directory"}: `${ex.romDirectory}`)")
+                    appendLine("  - ${if (language == AppLanguage.FR) "Destination GSI" else "GSI Target"}: `${ex.targetGsiPath}`")
+                    appendLine("  - ${if (language == AppLanguage.FR) "Mécanisme" else "Mechanism"}: ${ex.missingMechanism}")
+                    ex.importantElements.take(6).forEach { el -> appendLine("    - `$el`") }
+                }
+                appendLine()
+            }
             appendLine("### [DEDUCTION] ${if (language == AppLanguage.FR) "Bruit partagé écarté" else "Filtered Shared Noise"} (${portResult.filteredSharedNoiseCount})")
             portResult.sharedNoiseSamples.take(6).forEach { s ->
                 appendLine("- (${s.sourceFile}) ${s.title}: ${s.impact}")
@@ -884,6 +906,12 @@ class GeminiFodAiAnalyzer(private val context: Context) {
 
             ELF & DISASSEMBLY (${report.elfAnalyses.size}):
             $elfDump
+
+            DEEP OVERLAY INSPECTIONS (${report.overlayInspections.size}):
+            ${report.rawArtifacts.overlayDeepInspect.take(5000)}
+
+            DYNAMIC FILE PROVENANCE INDEX (${report.fileProvenance.size}):
+            ${report.rawArtifacts.fileProvenanceIndex.take(5000)}
 
             SELINUX / AVC SNIPPETS:
             ${report.rawArtifacts.selinuxDenials.take(2500)}

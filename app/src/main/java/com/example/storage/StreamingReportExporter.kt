@@ -106,6 +106,8 @@ object StreamingReportExporter {
                 writeRawEntry(zip, "raw/init_rc_snippets.txt", report.rawArtifacts.initRcSnippets)
                 writeRawEntry(zip, "raw/dmesg_delta.txt", report.rawArtifacts.dmesgDelta)
                 writeRawEntry(zip, "raw/surfaceflinger_live_delta.txt", report.rawArtifacts.surfaceFlingerLiveDelta)
+                writeRawEntry(zip, "raw/overlay_deep_inspect.txt", report.rawArtifacts.overlayDeepInspect)
+                writeRawEntry(zip, "raw/file_provenance_index.txt", report.rawArtifacts.fileProvenanceIndex)
             }
         }
         label
@@ -344,6 +346,8 @@ object StreamingReportExporter {
             "surfaceflinger_live_delta" to r.rawArtifacts.surfaceFlingerLiveDelta,
             "selinux_denials" to r.rawArtifacts.selinuxDenials,
             "init_rc_snippets" to r.rawArtifacts.initRcSnippets,
+            "overlay_deep_inspect" to r.rawArtifacts.overlayDeepInspect,
+            "file_provenance_index" to r.rawArtifacts.fileProvenanceIndex,
             "getprop_all" to r.rawArtifacts.getpropAll
         )
         rawBlocks.forEach { (title, body) ->
@@ -422,6 +426,8 @@ object StreamingReportExporter {
         }
         writeHtmlDetails(w, "RAW: dmesg_delta", r.rawArtifacts.dmesgDelta)
         writeHtmlDetails(w, "RAW: surfaceflinger_live_delta", r.rawArtifacts.surfaceFlingerLiveDelta)
+        writeHtmlDetails(w, "RAW: overlay_deep_inspect", r.rawArtifacts.overlayDeepInspect)
+        writeHtmlDetails(w, "RAW: file_provenance_index", r.rawArtifacts.fileProvenanceIndex)
         writeHtmlDetails(w, "RAW: getprop_all", r.rawArtifacts.getpropAll)
         w.appendLine("</body></html>")
     }
@@ -543,6 +549,24 @@ object StreamingReportExporter {
             w.appendLine(p.aiFactualSynthesis)
             w.appendLine()
         }
+        w.appendLine("## 2b. ${if (lang == AppLanguage.FR) "Fichiers & Mécanismes à extraire du Custom ROM" else "Files & Mechanisms to Extract From Custom ROM"} (${p.extractableFiles.size})")
+        if (p.extractableFiles.isEmpty()) {
+            w.appendLine(if (lang == AppLanguage.FR) "- Aucun fichier extractible identifié." else "- No extractable files identified.")
+        } else {
+            p.extractableFiles.forEach { ex ->
+                w.appendLine("### [${ex.category} · ${ex.priorityPercent}%] ${ex.title}")
+                w.appendLine("- **ROM File Path**: `${ex.romFilePath}`")
+                w.appendLine("- **ROM Directory**: `${ex.romDirectory}`")
+                w.appendLine("- **Target GSI Path (vendor/boot untouched)**: `${ex.targetGsiPath}`")
+                w.appendLine("- **GSI State**: `${ex.gsiCurrentState}`")
+                w.appendLine("- **Missing Mechanism**: ${ex.missingMechanism}")
+                if (ex.importantElements.isNotEmpty()) {
+                    w.appendLine("- **Important Internal Contents**:")
+                    ex.importantElements.forEach { el -> w.appendLine("  - `$el`") }
+                }
+                w.appendLine()
+            }
+        }
         w.appendLine("## 3. Ranked System-Side Porting Solutions (${p.portingSolutions.size})")
         p.portingSolutions.forEach { sol ->
             w.appendLine("### #${sol.rank} — ${sol.title} (${sol.confidencePercent}% confidence)")
@@ -617,6 +641,22 @@ object StreamingReportExporter {
 
         if (p.aiFactualSynthesis.isNotBlank()) {
             w.appendLine("<h2>100% Factual AI &amp; Porting Synthesis</h2><pre>${esc(p.aiFactualSynthesis)}</pre>")
+        }
+
+        w.appendLine("<h2>${if (lang == AppLanguage.FR) "Fichiers &amp; Mécanismes à extraire du Custom ROM" else "Files &amp; Mechanisms to Extract From Custom ROM"} (${p.extractableFiles.size})</h2>")
+        p.extractableFiles.forEach { ex ->
+            w.appendLine("<div class='card'>")
+            w.appendLine("<h3>[${esc(ex.category)} · ${ex.priorityPercent}%] ${esc(ex.title)}</h3>")
+            w.appendLine("<p><b>ROM File:</b> <code>${esc(ex.romFilePath)}</code></p>")
+            w.appendLine("<p><b>ROM Directory:</b> <code>${esc(ex.romDirectory)}</code></p>")
+            w.appendLine("<p><b>Target GSI (boot/vendor untouched):</b> <code>${esc(ex.targetGsiPath)}</code></p>")
+            w.appendLine("<p>${esc(ex.missingMechanism)}</p>")
+            if (ex.importantElements.isNotEmpty()) {
+                w.appendLine("<ul>")
+                ex.importantElements.forEach { el -> w.appendLine("<li><code>${esc(el)}</code></li>") }
+                w.appendLine("</ul>")
+            }
+            w.appendLine("</div>")
         }
 
         w.appendLine("<h2>Ranked GSI/System Porting Solutions (${p.portingSolutions.size})</h2>")

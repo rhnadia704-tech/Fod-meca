@@ -126,10 +126,12 @@ object FodComparatorEngine {
                     continue
                 }
 
+                val rMetaNorm = normalizeMetadataForComparison(rComp.metadata)
+                val gMetaNorm = normalizeMetadataForComparison(gComp.metadata)
                 val changed = rComp.status != gComp.status ||
                     rComp.version != gComp.version ||
                     rComp.interfaceType != gComp.interfaceType ||
-                    rComp.metadata != gComp.metadata
+                    rMetaNorm != gMetaNorm
 
                 if (changed) {
                     val isRealRegression = !rIsMissingOrUnknown && (gComp.status == EvidenceStatus.FAILED || gComp.status == EvidenceStatus.UNKNOWN)
@@ -418,6 +420,16 @@ object FodComparatorEngine {
             sharedNonBlockingItems = distinctSharedNoise
         )
     }
+
+    private fun normalizeMetadataForComparison(meta: Map<String, String>): Map<String, String> =
+        meta.mapValues { (_, v) ->
+            v.replace(Regex("Brightness=[0-9.E-]+", RegexOption.IGNORE_CASE), "Brightness=<norm>")
+                .replace(Regex("SdrBrightness=[0-9.E-]+", RegexOption.IGNORE_CASE), "SdrBrightness=<norm>")
+                .replace(Regex("address StablePhysical\\{[^}]+}", RegexOption.IGNORE_CASE), "address=<norm>")
+                .replace(Regex("ManufactureDate\\{[^}]+}", RegexOption.IGNORE_CASE), "ManufactureDate=<norm>")
+                .replace(Regex("frameRateOverride[^,|]*", RegexOption.IGNORE_CASE), "")
+                .trim()
+        }
 
     private fun normalizeLimitation(raw: String): String =
         raw.lowercase()

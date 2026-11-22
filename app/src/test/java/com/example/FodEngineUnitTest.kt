@@ -1,6 +1,7 @@
 package com.example
 
 import com.example.engine.BaselineProbeResult
+import com.example.engine.DynamicProvenanceInspector
 import com.example.engine.ElfDisassembler
 import com.example.engine.FodComparatorEngine
 import com.example.engine.PatchAndArchitectureAnalyzer
@@ -15,23 +16,27 @@ import com.example.model.DiagnosticSummary
 import com.example.model.DiscoveredComponent
 import com.example.model.EnvironmentSnapshot
 import com.example.model.EvidenceStatus
+import com.example.model.FileProvenanceArtifact
 import com.example.model.FingerDownStep
 import com.example.model.FodDiagnosticReport
 import com.example.model.KnowledgeLevel
+import com.example.model.OverlayDeepInspection
 import com.example.model.RawArtifactsBundle
 import com.example.model.SessionEvent
 import com.example.model.SysfsTransition
 import com.example.storage.StreamingReportExporter
 import java.io.BufferedWriter
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.StringWriter
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
 
 class FodEngineUnitTest {
 
@@ -387,4 +392,193 @@ class FodEngineUnitTest {
         }
         assertTrue(htmlOut.toString().contains("FOD PORTING DOSSIER"))
     }
+
+    @Test
+    fun dynamicProvenanceInspector_parsesDumpsysOverlayBlocksAndBinaryApkPools() {
+        val rawDump = """
+            com.android.systemui.overlay.spoonoverlay2025:0 {
+              mPackageName=com.android.systemui.overlay.spoonoverlay2025
+              mTargetPackageName=com.android.systemui
+              mBaseCodePath=/product/overlay/SpoonOverlay2025/SpoonOverlay2025.apk
+              mState=STATE_ENABLED
+              mIsEnabled=true
+              mIsStatic=false
+              mPriority=150
+            }
+            org.treble.other:0 {
+              mPackageName=org.treble.other
+              mTargetPackageName=android
+              mBaseCodePath=/system_ext/overlay/Other.apk
+              mState=STATE_DISABLED
+              mPriority=10
+            }
+        """.trimIndent()
+
+        val parsedDump = DynamicProvenanceInspector.parseDumpsysOverlayBlocks(rawDump)
+        val spoon = parsedDump["com.android.systemui.overlay.spoonoverlay2025"]
+        assertTrue(spoon != null)
+        assertEquals("com.android.systemui", spoon?.targetPackage)
+        assertEquals("/product/overlay/SpoonOverlay2025/SpoonOverlay2025.apk", spoon?.baseCodePath)
+        assertEquals(150, spoon?.priority)
+        assertTrue(spoon?.isEnabled == true)
+        assertFalse(parsedDump["org.treble.other"]?.isEnabled ?: true)
+
+        fun buildUtf8StringPoolChunk(strings: List<String>): ByteArray {
+            val dataBaos = ByteArrayOutputStream()
+            val offsets = IntArray(strings.size)
+            strings.forEachIndexed { idx, s ->
+                offsets[idx] = dataBaos.size()
+                val utf8 = s.toByteArray(Charsets.UTF_8)
+                dataBaos.write(s.length and 0x7F)
+                dataBaos.write(utf8.size and 0x7F)
+                dataBaos.write(utf8)
+                dataBaos.write(0)
+            }
+            while (dataBaos.size() % 4 != 0) dataBaos.write(0)
+            val strData = dataBaos.toByteArray()
+            val headerSize = 28
+            val stringsStart = headerSize + strings.size * 4
+            val chunkSize = stringsStart + strData.size
+            val buf = ByteBuffer.allocate(chunkSize).order(ByteOrder.LITTLE_ENDIAN)
+            buf.putShort(0x0001.toShort()) // RES_STRING_POOL_TYPE
+            buf.putShort(headerSize.toShort())
+            buf.putInt(chunkSize)
+            buf.putInt(strings.size) // stringCount
+            buf.putInt(0) // styleCount
+            buf.putInt(0x100) // UTF8_FLAG
+            buf.putInt(stringsStart)
+            buf.putInt(0) // stylesStart
+            offsets.forEach { buf.putInt(it) }
+            buf.put(strData)
+            return buf.array()
+        }
+
+        val apkBaos = ByteArrayOutputStream()
+        ZipOutputStream(apkBaos).use { zip ->
+            zip.putNextEntry(ZipEntry("AndroidManifest.xml"))
+            zip.write(buildUtf8StringPoolChunk(listOf("com.android.systemui.overlay.spoonoverlay2025", "com.android.systemui")))
+            zip.closeEntry()
+
+            zip.putNextEntry(ZipEntry("resources.arsc"))
+            zip.write(buildUtf8StringPoolChunk(listOf("config_supportsUdfps", "config_udfps_hbm_sysfs_node", "unrelated_color")))
+            zip.closeEntry()
+        }
+
+        val parsedApk = DynamicProvenanceInspector.parseApkBinaryFodDetails(apkBaos.toByteArray())
+        assertEquals("com.android.systemui", parsedApk.inferredTargetPackage)
+        assertTrue(parsedApk.fodResourceStrings.any { it == "arsc: config_supportsUdfps" })
+        assertTrue(parsedApk.fodResourceStrings.any { it == "arsc: config_udfps_hbm_sysfs_node" })
+        assertTrue(parsedApk.discoveredResourceKeys.any { it.second == "config_supportsUdfps" })
+        assertFalse(parsedApk.fodResourceStrings.any { it.contains("unrelated_color") })
+    }
+
+    @Test
+    fun portEngine_stripsDisplayBrightnessNoiseAndBuildsExtractableProvenance() {
+        val romOverlays = listOf(
+            OverlayDeepInspection(
+                packageName = "com.android.systemui.overlay.spoonoverlay2025",
+                targetPackage = "com.android.systemui",
+                apkPath = "/product/overlay/SpoonOverlay2025/SpoonOverlay2025.apk",
+                directory = "/product/overlay/SpoonOverlay2025",
+                isEnabled = true,
+                isStatic = false,
+                priority = 150,
+                manifestSummary = listOf("Overrides targetPackage=com.android.systemui"),
+                fodConfigEntries = listOf(
+                    "VALUE bool/config_supportsUdfps = true",
+                    "VALUE string/config_udfps_hbm_sysfs_node = /sys/devices/platform/soc/soc:qcom,dsi-display-primary/fod_ui"
+                )
+            )
+        )
+        val romProvenance = listOf(
+            FileProvenanceArtifact(
+                id = "p_prop",
+                category = "PROP_FILE",
+                filePath = "/product/etc/build.prop",
+                directory = "/product/etc",
+                matchedSymbolOrKey = "2 FOD props",
+                importantContents = listOf("ro.hardware.fp.fod=true", "persist.sys.fod.hbm=1")
+            ),
+            FileProvenanceArtifact(
+                id = "p_disp",
+                category = "DISPLAY_CONFIG",
+                filePath = "/product/etc/displayconfig/display_id_0.xml",
+                directory = "/product/etc/displayconfig",
+                matchedSymbolOrKey = "display_id_0.xml",
+                importantContents = listOf("<highBrightnessMode enabled=\"true\">", "<sdrHdrRatioMap>")
+            ),
+            FileProvenanceArtifact(
+                id = "p_selinux",
+                category = "SELINUX_POLICY",
+                filePath = "/system_ext/etc/selinux/system_ext_fod.cil",
+                directory = "/system_ext/etc/selinux",
+                matchedSymbolOrKey = "1 rule",
+                importantContents = listOf("(allow system_app sysfs_fod (file (read write open)))")
+            )
+        )
+
+        val romFiles = mapOf(
+            "metadata/environment.txt" to "Boot Signature: 4.14.357-openela-perf\nVendor Fingerprint: google/mustang/release-keys",
+            "raw/getprop_all.txt" to "[ro.hardware.fp.fod]: [true]\n[persist.sys.fod.hbm]: [1]\n",
+            "raw/dumpsys_overlay.txt" to "[x] com.android.systemui.overlay.spoonoverlay2025\n",
+            "raw/overlay_deep_inspect.txt" to DynamicProvenanceInspector.serializeOverlayDeepInspect(romOverlays),
+            "raw/file_provenance_index.txt" to DynamicProvenanceInspector.serializeFileProvenanceIndex(romProvenance),
+            "raw/init_rc_snippets.txt" to "/system_ext/etc/init/init.fod.rc: chmod 0664 /sys/class/drm/card0-DSI-1/disp_param\n",
+            "raw/dumpsys_display.txt" to "Display Brightness=5.1148894E-4 | Display SdrBrightness=5.1148894E-4 | DisplayDeviceInfo{\"Ecran\": uniqueId=\"local:1\", supportedColorModes [0, 7, 9], hbmMode=HIGH_BRIGHTNESS_MODE_HDR, address StablePhysical{id=4630947119594951809, port=129}, ManufactureDate{week=27, year=2006}}"
+        )
+        val gsiFiles = mapOf(
+            "metadata/environment.txt" to "Boot Signature: 4.14.357-openela-perf\nVendor Fingerprint: google/mustang/release-keys",
+            "raw/getprop_all.txt" to "[persist.sys.phh.fod.xiaomi]: [true]\n",
+            "raw/dumpsys_overlay.txt" to "[x] org.treble.generic\n",
+            "raw/init_rc_snippets.txt" to "",
+            "raw/dumpsys_display.txt" to "Display Brightness=0.029811 | Display SdrBrightness=0.029811 | DisplayDeviceInfo{\"Ecran\": uniqueId=\"local:2\", supportedColorModes [0], address StablePhysical{id=999, port=1}, ManufactureDate{week=1, year=2025}}"
+        )
+
+        fun zipFrom(map: Map<String, String>): ByteArray {
+            val baos = ByteArrayOutputStream()
+            ZipOutputStream(baos).use { z ->
+                map.forEach { (name, content) ->
+                    z.putNextEntry(ZipEntry(name))
+                    z.write(content.toByteArray(Charsets.UTF_8))
+                    z.closeEntry()
+                }
+            }
+            return baos.toByteArray()
+        }
+
+        val romBundle = PortZipDeepReader.readCompleteZipStream(ByteArrayInputStream(zipFrom(romFiles)), "ROM", "rom_new.zip")
+        val gsiBundle = PortZipDeepReader.readCompleteZipStream(ByteArrayInputStream(zipFrom(gsiFiles)), "GSI", "gsi_new.zip")
+
+        val portResult = PortAnalysisEngine.analyze(romBundle, gsiBundle, AppLanguage.FR)
+
+        // Display noise (Brightness floats, StablePhysical, ManufactureDate) MUST NOT pollute factualDiffs
+        val allDiffText = portResult.factualDiffs.joinToString("\n") { "${it.title} | ${it.romEvidence} | ${it.gsiEvidence}" }
+        assertFalse(allDiffText.contains("5.1148894E-4"))
+        assertFalse(allDiffText.contains("StablePhysical"))
+        assertFalse(allDiffText.contains("ManufactureDate"))
+        // Real display HBM/ColorMode delta IS captured cleanly
+        assertTrue(portResult.factualDiffs.any { it.category == "DISPLAY / HBM PIPELINE" && it.romEvidence.contains("hbmMode=HIGH_BRIGHTNESS_MODE_HDR") })
+
+        // Actionable extractable files dossier pinpoints exact paths, directories, and internal contents
+        val spoonExtract = portResult.extractableFiles.firstOrNull { it.title == "com.android.systemui.overlay.spoonoverlay2025" }
+        assertTrue(spoonExtract != null)
+        assertEquals("/product/overlay/SpoonOverlay2025/SpoonOverlay2025.apk", spoonExtract?.romFilePath)
+        assertEquals("/product/overlay/SpoonOverlay2025", spoonExtract?.romDirectory)
+        assertTrue(spoonExtract?.importantElements?.any { it.contains("config_supportsUdfps") } == true)
+
+        assertTrue(portResult.extractableFiles.any { it.romFilePath == "/product/etc/build.prop" && it.romDirectory == "/product/etc" })
+        assertTrue(portResult.extractableFiles.any { it.romFilePath == "/system_ext/etc/init/init.fod.rc" && it.romDirectory == "/system_ext/etc/init" })
+        assertTrue(portResult.extractableFiles.any { it.romFilePath == "/product/etc/displayconfig/display_id_0.xml" })
+        assertTrue(portResult.extractableFiles.any { it.romFilePath == "/system_ext/etc/selinux/system_ext_fod.cil" })
+
+        val mdOut = StringWriter()
+        BufferedWriter(mdOut).use { bw ->
+            StreamingReportExporter.streamPortMarkdown(bw, portResult, romBundle, gsiBundle, AppLanguage.FR)
+        }
+        val mdStr = mdOut.toString()
+        assertTrue(mdStr.contains("Fichiers & Mécanismes à extraire du Custom ROM"))
+        assertTrue(mdStr.contains("/product/overlay/SpoonOverlay2025/SpoonOverlay2025.apk"))
+        assertTrue(mdStr.contains("/product/overlay/SpoonOverlay2025"))
+    }
 }
+

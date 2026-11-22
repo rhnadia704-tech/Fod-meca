@@ -2,7 +2,10 @@ package com.example.engine
 
 import com.example.i18n.AppLanguage
 import com.example.model.EvidenceStatus
+import com.example.model.ExtractableFileItem
+import com.example.model.FileProvenanceArtifact
 import com.example.model.KnowledgeLevel
+import com.example.model.OverlayDeepInspection
 import com.example.model.PortAnalysisResult
 import com.example.model.PortFileDiffItem
 import com.example.model.PortingCandidateSolution
@@ -42,20 +45,26 @@ object PortAnalysisEngine {
         val factualDiffs = mutableListOf<PortFileDiffItem>()
         val sharedNoise = mutableListOf<PortFileDiffItem>()
 
+        val romOverlays = loadOverlayInspections(romZip)
+        val gsiOverlays = loadOverlayInspections(gsiZip)
+        val romProvenance = loadFileProvenance(romZip)
+        val gsiProvenance = loadFileProvenance(gsiZip)
+
         // 1. Exhaustive getprop_all.txt diff across ALL FOD/Display/Biometric/Treble/Vendor/System props
         diffGetpropFiles(romZip, gsiZip, factualDiffs, sharedNoise, language)
 
-        // 2. Exhaustive cmd overlay / dumpsys_overlay diff (distinguishing active vs inactive overlays!)
-        diffOverlayFiles(romZip, gsiZip, factualDiffs, sharedNoise, language)
+        // 2. Exhaustive cmd overlay / dumpsys_overlay + deep APK provenance diff
+        diffOverlayFiles(romZip, gsiZip, romOverlays, gsiOverlays, factualDiffs, sharedNoise, language)
 
-        // 3. dumpsys_fingerprint + dumpsys_biometric + dumpsys_display + dumpsys_surfaceflinger
+        // 3. dumpsys_fingerprint + dumpsys_biometric + dumpsys_display + dumpsys_surfaceflinger (noise-filtered!)
         diffDumpsysBiometricAndDisplay(romZip, gsiZip, factualDiffs, language)
 
         // 4. lshal + vintf_manifests + service_list
         diffHalAndBinderLayer(romZip, gsiZip, factualDiffs, sharedNoise, language)
 
-        // 5. init_rc_snippets + sysfs_fod_nodes + selinux_denials
+        // 5. init_rc_snippets + sysfs_fod_nodes + selinux_denials + dynamic file provenance (XML, SELinux, prop files, SystemUI)
         diffInitSysfsAndSelinux(romZip, gsiZip, factualDiffs, sharedNoise, language)
+        diffProvenanceArtifacts(romProvenance, gsiProvenance, factualDiffs, language)
 
         // 6. Live enrollment behavior (fingerDownChain, sysfsTransitions, dmesgDelta, logcat_enrollment)
         diffLiveExecutionAndLogs(romZip, gsiZip, factualDiffs, sharedNoise, language)
@@ -69,11 +78,24 @@ object PortAnalysisEngine {
 
         val sortedNoise = sharedNoise.distinctBy { "${it.sourceFile}::${it.title}" }
 
-        // Build ranked system/GSI porting solutions strictly respecting untouched boot & vendor
+        // 8. Build actionable "Files & Mechanisms to Extract from Custom ROM" dossier
+        val extractableFiles = buildExtractableFiles(
+            romZip = romZip,
+            gsiZip = gsiZip,
+            romOverlays = romOverlays,
+            gsiOverlays = gsiOverlays,
+            romProvenance = romProvenance,
+            gsiProvenance = gsiProvenance,
+            diffs = sortedDiffs,
+            language = language
+        )
+
+        // 9. Build ranked system/GSI porting solutions strictly respecting untouched boot & vendor
         val solutions = buildRankedPortingSolutions(
             romZip = romZip,
             gsiZip = gsiZip,
             diffs = sortedDiffs,
+            extractables = extractableFiles,
             language = language
         )
 
@@ -82,6 +104,7 @@ object PortAnalysisEngine {
             gsiZip = gsiZip,
             diffs = sortedDiffs,
             solutions = solutions,
+            extractables = extractableFiles,
             language = language
         )
 
@@ -100,7 +123,8 @@ object PortAnalysisEngine {
             factualDiffs = sortedDiffs,
             filteredSharedNoiseCount = sortedNoise.size,
             sharedNoiseSamples = sortedNoise,
-            portingSolutions = solutions
+            portingSolutions = solutions,
+            extractableFiles = extractableFiles
         )
     }
 
@@ -159,8 +183,15 @@ object PortAnalysisEngine {
                     )
                 }
                 rv != null && gv != null -> {
-                    // Ignore build/date/serial noise
-                    if (key.contains("build.date") || key.contains("build.id") || key.contains("build.fingerprint") && !key.contains("vendor")) {
+                    // Ignore build/date/serial/vm telemetry noise
+                    val isMetadataNoise = key.contains("build.date", true) ||
+                        key.contains("build.id", true) ||
+                        key.contains("build.display.id", true) ||
+                        key.contains("build.version.", true) ||
+                        key.contains("dalvik.vm.", true) ||
+                        key.contains("persist.sys.timezone", true) ||
+                        (key.contains("build.fingerprint", true) && !key.contains("vendor", true))
+                    if (isMetadataNoise) {
                         noise += PortFileDiffItem(
                             id = "prop_build_${key.hashCode()}",
                             sourceFile = "raw/getprop_all.txt",
@@ -168,7 +199,7 @@ object PortAnalysisEngine {
                             title = key,
                             romEvidence = rv,
                             gsiEvidence = gv,
-                            impact = "Build metadata difference",
+                            impact = "Build/runtime metadata difference (non-blocking)",
                             status = EvidenceStatus.OBSERVED,
                             knowledgeLevel = KnowledgeLevel.FACT
                         )
@@ -193,22 +224,34 @@ object PortAnalysisEngine {
     private fun diffOverlayFiles(
         romZip: RawZipArchiveBundle,
         gsiZip: RawZipArchiveBundle,
+        romOverlays: Map<String, OverlayDeepInspection>,
+        gsiOverlays: Map<String, OverlayDeepInspection>,
         diffs: MutableList<PortFileDiffItem>,
         noise: MutableList<PortFileDiffItem>,
         language: AppLanguage
     ) {
         val romLines = parseOverlayStates(readRaw(romZip, "raw/dumpsys_overlay.txt"))
         val gsiLines = parseOverlayStates(readRaw(gsiZip, "raw/dumpsys_overlay.txt"))
-        val allNames = (romLines.keys + gsiLines.keys).distinct()
+        val allNames = (romLines.keys + gsiLines.keys + romOverlays.keys + gsiOverlays.keys).distinct()
 
         for (pkg in allNames) {
-            val rEnabled = romLines[pkg]
-            val gEnabled = gsiLines[pkg]
+            val rDeep = romOverlays[pkg]
+            val gDeep = gsiOverlays[pkg]
+            val rEnabled = romLines[pkg] ?: rDeep?.isEnabled
+            val gEnabled = gsiLines[pkg] ?: gDeep?.isEnabled
             val isBiometricOrDisplayOverlay = pkg.contains("fod", true) || pkg.contains("udfps", true) ||
                 pkg.contains("fingerprint", true) || pkg.contains("biometric", true) ||
                 pkg.contains("treble", true) || pkg.contains("systemui", true) ||
                 pkg.contains("display", true) || pkg.contains("overlay", true)
             if (!isBiometricOrDisplayOverlay) continue
+
+            val romLocNote = rDeep?.let { ov ->
+                buildString {
+                    append("APK=${ov.apkPath} (Dir=${ov.directory})")
+                    if (ov.targetPackage.isNotBlank()) append(" -> target=${ov.targetPackage}")
+                    if (ov.fodConfigEntries.isNotEmpty()) append(" | Keys: ${ov.fodConfigEntries.take(6).joinToString("; ")}")
+                }
+            }.orEmpty()
 
             when {
                 rEnabled == true && (gEnabled == null || gEnabled == false) -> {
@@ -216,15 +259,17 @@ object PortAnalysisEngine {
                     val targetList = if (isGenericUi) noise else diffs
                     targetList += PortFileDiffItem(
                         id = "rro_miss_${pkg.hashCode()}",
-                        sourceFile = "raw/dumpsys_overlay.txt",
+                        sourceFile = if (rDeep != null && rDeep.apkPath != "UNKNOWN") rDeep.apkPath else "raw/dumpsys_overlay.txt",
                         category = "RRO OVERLAYS",
                         title = pkg,
-                        romEvidence = "[x] ENABLED",
-                        gsiEvidence = if (gEnabled == null) "ABSENT" else "[ ] INACTIVE",
+                        romEvidence = "[x] ENABLED" + if (romLocNote.isNotBlank()) "\n$romLocNote" else "",
+                        gsiEvidence = if (gEnabled == null) "ABSENT" else "[ ] INACTIVE (${gDeep?.apkPath ?: "unknown path"})",
                         impact = if (language == AppLanguage.FR) {
-                            "Overlay RRO actif sur Custom ROM mais absent/inactif sur GSI (configuration config_udfps / display / framework)."
+                            "Overlay RRO actif sur Custom ROM mais absent/inactif sur GSI" +
+                                (rDeep?.apkPath?.takeIf { it != "UNKNOWN" }?.let { " — fichier ROM à inspecter/extraire : $it" } ?: ".")
                         } else {
-                            "RRO overlay enabled on Custom ROM yet missing/inactive on GSI."
+                            "RRO overlay enabled on Custom ROM yet missing/inactive on GSI" +
+                                (rDeep?.apkPath?.takeIf { it != "UNKNOWN" }?.let { " — ROM APK file: $it" } ?: ".")
                         },
                         status = if (pkg.contains("fod", true) || pkg.contains("udfps", true) || pkg.contains("fingerprint", true) || pkg.contains("systemui", true)) EvidenceStatus.FAILED else EvidenceStatus.SUSPECT,
                         knowledgeLevel = KnowledgeLevel.FACT
@@ -250,11 +295,11 @@ object PortAnalysisEngine {
                 rEnabled == null && gEnabled == true -> {
                     diffs += PortFileDiffItem(
                         id = "rro_gsionly_${pkg.hashCode()}",
-                        sourceFile = "raw/dumpsys_overlay.txt",
+                        sourceFile = if (gDeep != null && gDeep.apkPath != "UNKNOWN") gDeep.apkPath else "raw/dumpsys_overlay.txt",
                         category = "RRO OVERLAYS",
                         title = pkg,
                         romEvidence = "Absent on ROM",
-                        gsiEvidence = "[x] ENABLED",
+                        gsiEvidence = "[x] ENABLED" + (gDeep?.let { "\nAPK=${it.apkPath} | target=${it.targetPackage}" }.orEmpty()),
                         impact = if (language == AppLanguage.FR) {
                             "Overlay Treble/GSI activé côté GSI uniquement : vérifier les coordonnées et flags HBM."
                         } else {
@@ -274,18 +319,15 @@ object PortAnalysisEngine {
         diffs: MutableList<PortFileDiffItem>,
         language: AppLanguage
     ) {
-        val pairs = listOf(
-            "raw/dumpsys_fingerprint.txt" to Regex("(sensor|udfps|fod|type=|supports|strength|resetLockout|acquired|client|hal).*", RegexOption.IGNORE_CASE),
-            "raw/dumpsys_biometric.txt" to Regex("(sensor|modality|authenticator|strength|udfps|fod).*", RegexOption.IGNORE_CASE),
-            "raw/dumpsys_display.txt" to Regex("(hbm|lhbm|brightness|hdr|colorMode|refreshRate|udfps|fod|ActiveMode).*", RegexOption.IGNORE_CASE),
-            "raw/dumpsys_surfaceflinger.txt" to Regex("(udfps|fod|fingerprint|hbm|lhbm|dim|color|hwc|composer).*", RegexOption.IGNORE_CASE)
+        // 1. Structured fingerprint & biometric dumpsys comparison
+        val bioPairs = listOf(
+            "raw/dumpsys_fingerprint.txt" to Regex("(sensor|udfps|fod|type=|supports|strength|resetLockout|acquired|hal).*", RegexOption.IGNORE_CASE),
+            "raw/dumpsys_biometric.txt" to Regex("(sensor|modality|authenticator|strength|udfps|fod).*", RegexOption.IGNORE_CASE)
         )
-
-        pairs.forEach { (file, kw) ->
+        bioPairs.forEach { (file, kw) ->
             val rLines = extractKeyLines(readRaw(romZip, file), kw)
             val gLines = extractKeyLines(readRaw(gsiZip, file), kw)
             if (rLines.isEmpty() && gLines.isEmpty()) return@forEach
-
             val onlyRom = rLines.filter { it !in gLines }.take(12)
             val onlyGsi = gLines.filter { it !in rLines }.take(12)
             if (onlyRom.isNotEmpty() || onlyGsi.isNotEmpty()) {
@@ -297,15 +339,85 @@ object PortAnalysisEngine {
                     romEvidence = onlyRom.joinToString("\n").ifBlank { "(identical or none unique)" },
                     gsiEvidence = onlyGsi.joinToString("\n").ifBlank { "(missing ROM signatures)" },
                     impact = if (language == AppLanguage.FR) {
-                        "Divergence d'état réel dans $file (paramètres capteur UDFPS, HBM ou SurfaceFlinger)."
+                        "Divergence d'état capteur biométrique / UDFPS dans $file."
                     } else {
-                        "State divergence inside $file (UDFPS sensorProps, HBM, or SurfaceFlinger pipeline)."
+                        "Biometric/UDFPS sensor state divergence inside $file."
                     },
                     status = if (onlyRom.isNotEmpty()) EvidenceStatus.FAILED else EvidenceStatus.SUSPECT,
                     knowledgeLevel = KnowledgeLevel.FACT
                 )
             }
         }
+
+        // 2. Display & SurfaceFlinger structural signals (strictly stripping Brightness floats, StablePhysical addresses, DisplayCutout, dates)
+        listOf(
+            "raw/dumpsys_display.txt" to true,
+            "raw/dumpsys_surfaceflinger.txt" to false
+        ).forEach { (file, isDisplay) ->
+            val rSignals = extractStructuredDisplaySignals(readRaw(romZip, file), isDisplay)
+            val gSignals = extractStructuredDisplaySignals(readRaw(gsiZip, file), isDisplay)
+            if (rSignals.isEmpty() && gSignals.isEmpty()) return@forEach
+
+            val onlyRom = rSignals.filter { it !in gSignals }.take(12)
+            val onlyGsi = gSignals.filter { it !in rSignals }.take(12)
+            if (onlyRom.isNotEmpty() || onlyGsi.isNotEmpty()) {
+                diffs += PortFileDiffItem(
+                    id = "dump_struct_${file.hashCode()}",
+                    sourceFile = file,
+                    category = "DISPLAY / HBM PIPELINE",
+                    title = "${file.substringAfterLast('/')} (HBM / ColorMode / FOD Layers)",
+                    romEvidence = onlyRom.joinToString("\n").ifBlank { "(none unique)" },
+                    gsiEvidence = onlyGsi.joinToString("\n").ifBlank { "(missing ROM HBM/ColorMode/Layer signals)" },
+                    impact = if (language == AppLanguage.FR) {
+                        "Divergence réelle HBM / ColorMode / Calque FOD dans $file (bruit Brightness/Adresse/Cutout filtré)."
+                    } else {
+                        "True HBM / ColorMode / FOD layer divergence in $file (Brightness/Address/Cutout noise stripped)."
+                    },
+                    status = if (onlyRom.any { it.contains("hbm", true) || it.contains("udfps", true) || it.contains("fod", true) || it.contains("color", true) }) {
+                        EvidenceStatus.FAILED
+                    } else {
+                        EvidenceStatus.SUSPECT
+                    },
+                    knowledgeLevel = KnowledgeLevel.FACT
+                )
+            }
+        }
+    }
+
+    internal fun extractStructuredDisplaySignals(raw: String, isDisplayDumpsys: Boolean): List<String> {
+        if (raw.isBlank()) return emptyList()
+        val noiseTokenRegex = Regex(
+            "(^(Display\\s+)?(Brightness|SdrBrightness)=|mBrightnessState=|brightnessMinimum|brightnessMaximum|brightnessDefault|brightnessDim|hdrSdrRatio|address\\s+StablePhysical|address\\s*\\{|uniqueId=|DisplayCutout|cutoutPathParserInfo|RoundedCorners|deviceProductInfo|ManufactureDate|frameRateOverride|appVsyncOff|presDeadline|vsync=|mSequence=|mLastObserved|mActualBacklight|mTargetBacklight|timestamp)",
+            RegexOption.IGNORE_CASE
+        )
+        val fodDisplayRegex = Regex(
+            "(hbm|lhbm|udfps|fod|dimlayer|dim\\s*layer|colormode|supportedcolormodes|supportedhdrtypes|high_brightness|highbrightness|mactivecolormode|fingerprint|biometric|maxluminance)",
+            RegexOption.IGNORE_CASE
+        )
+
+        val out = linkedSetOf<String>()
+        raw.lineSequence().forEach { rawLine ->
+            val trimmed = rawLine.trim()
+            if (trimmed.isEmpty()) return@forEach
+
+            // Break long single-line dumps (like DisplayDeviceInfo{...}) into atomic key=value tokens
+            val fragments = if (trimmed.length > 180) {
+                trimmed.split(Regex(",\\s+|\\s+\\|\\s+|;\\s+"))
+            } else {
+                listOf(trimmed)
+            }
+
+            for (frag in fragments) {
+                val clean = frag.trim().removePrefix("{").removeSuffix("}")
+                if (clean.length !in 4..200) continue
+                if (noiseTokenRegex.containsMatchIn(clean)) continue
+                if (isDisplayDumpsys && (clean.contains("DisplayDeviceInfo", true) && clean.length > 140)) continue
+                if (fodDisplayRegex.containsMatchIn(clean)) {
+                    out += clean
+                }
+            }
+        }
+        return out.take(120)
     }
 
     private fun diffHalAndBinderLayer(
@@ -529,10 +641,293 @@ object PortAnalysisEngine {
         }
     }
 
+    private fun diffProvenanceArtifacts(
+        romProv: List<FileProvenanceArtifact>,
+        gsiProv: List<FileProvenanceArtifact>,
+        diffs: MutableList<PortFileDiffItem>,
+        language: AppLanguage
+    ) {
+        if (romProv.isEmpty() && gsiProv.isEmpty()) return
+        val gsiByPath = gsiProv.associateBy { it.filePath }
+        val gsiByFileName = gsiProv.groupBy { it.filePath.substringAfterLast('/') }
+
+        for (rItem in romProv) {
+            if (rItem.category == "OVERLAY_APK") continue // already covered with full details in diffOverlayFiles
+            val gExact = gsiByPath[rItem.filePath]
+            val gMatch = gExact ?: gsiByFileName[rItem.filePath.substringAfterLast('/')]?.firstOrNull()
+            if (gMatch == null) {
+                val isSystemPartition = !rItem.filePath.startsWith("/vendor/") && !rItem.filePath.startsWith("/odm/")
+                diffs += PortFileDiffItem(
+                    id = "prov_miss_${rItem.id.hashCode()}",
+                    sourceFile = rItem.filePath,
+                    category = "FILE PROVENANCE (${rItem.category})",
+                    title = "${rItem.filePath} (${rItem.directory})",
+                    romEvidence = rItem.importantContents.take(8).joinToString(" | ").ifBlank { rItem.matchedSymbolOrKey },
+                    gsiEvidence = if (language == AppLanguage.FR) "ABSENT sur GSI" else "ABSENT on GSI",
+                    impact = if (isSystemPartition) {
+                        if (language == AppLanguage.FR) {
+                            "Fichier système/product FOD présent sur ROM (${rItem.filePath}) mais absent côté GSI."
+                        } else {
+                            "System/product FOD file present on ROM (${rItem.filePath}) yet missing on GSI."
+                        }
+                    } else {
+                        if (language == AppLanguage.FR) {
+                            "Fichier partition vendor/odm lu sur ROM ; vendor intact mais ses propriétés/règles doivent être reflétées côté GSI."
+                        } else {
+                            "Vendor/odm artifact read on ROM; keep vendor untouched and mirror required interface/props on GSI."
+                        }
+                    },
+                    status = if (isSystemPartition) EvidenceStatus.FAILED else EvidenceStatus.OBSERVED,
+                    knowledgeLevel = KnowledgeLevel.FACT
+                )
+            } else {
+                val rSet = rItem.importantContents.toSet()
+                val gSet = gMatch.importantContents.toSet()
+                val onlyRomLines = (rSet - gSet).take(8)
+                if (onlyRomLines.isNotEmpty()) {
+                    diffs += PortFileDiffItem(
+                        id = "prov_diff_${rItem.id.hashCode()}",
+                        sourceFile = rItem.filePath,
+                        category = "FILE PROVENANCE (${rItem.category})",
+                        title = "Delta interne : ${rItem.filePath}",
+                        romEvidence = onlyRomLines.joinToString(" | "),
+                        gsiEvidence = gMatch.importantContents.take(6).joinToString(" | ").ifBlank { "(empty)" },
+                        impact = if (language == AppLanguage.FR) {
+                            "Entrées internes présentes dans ${rItem.filePath} sur Custom ROM mais absentes/différentes dans ${gMatch.filePath} sur GSI."
+                        } else {
+                            "Internal entries present in ROM ${rItem.filePath} yet missing/different in GSI ${gMatch.filePath}."
+                        },
+                        status = EvidenceStatus.SUSPECT,
+                        knowledgeLevel = KnowledgeLevel.FACT
+                    )
+                }
+            }
+        }
+    }
+
+    private fun buildExtractableFiles(
+        romZip: RawZipArchiveBundle,
+        gsiZip: RawZipArchiveBundle,
+        romOverlays: Map<String, OverlayDeepInspection>,
+        gsiOverlays: Map<String, OverlayDeepInspection>,
+        romProvenance: List<FileProvenanceArtifact>,
+        gsiProvenance: List<FileProvenanceArtifact>,
+        diffs: List<PortFileDiffItem>,
+        language: AppLanguage
+    ): List<ExtractableFileItem> {
+        val items = mutableListOf<ExtractableFileItem>()
+
+        // 1. Missing/Inactive active RRO Overlay APKs (highest actionable value!)
+        val rroDiffs = diffs.filter { it.category == "RRO OVERLAYS" && it.romEvidence.contains("ENABLED", true) }
+        rroDiffs.forEach { d ->
+            val pkg = d.title
+            val deep = romOverlays[pkg]
+            val apkPath = deep?.apkPath?.takeIf { it != "UNKNOWN" }
+            val dir = deep?.directory?.takeIf { it != "UNKNOWN" }
+            val fileName = apkPath?.substringAfterLast('/') ?: "${pkg.substringAfterLast('.')}.apk"
+            val targetPath = when {
+                apkPath != null && (apkPath.startsWith("/product/") || apkPath.startsWith("/system_ext/") || apkPath.startsWith("/system/")) -> apkPath
+                else -> "/product/overlay/$fileName"
+            }
+            val contents = buildList {
+                if (deep != null) {
+                    if (deep.targetPackage.isNotBlank()) add("targetPackage=${deep.targetPackage} | static=${deep.isStatic} | priority=${deep.priority}")
+                    addAll(deep.manifestSummary.take(6))
+                    addAll(deep.fodConfigEntries.take(20))
+                } else {
+                    add(
+                        if (language == AppLanguage.FR) {
+                            "Archive ROM antérieure sans overlay_deep_inspect.txt — relancez ANALYSE sur Custom ROM pour extraire l'APK exact et ses clés ARSC/XML."
+                        } else {
+                            "Legacy ROM archive lacks overlay_deep_inspect.txt — re-run ANALYSE on Custom ROM to resolve exact APK path & ARSC/XML keys."
+                        }
+                    )
+                }
+            }
+            val isCoreFodOrSysUi = pkg.contains("fod", true) || pkg.contains("udfps", true) ||
+                pkg.contains("fingerprint", true) || pkg.contains("systemui", true) ||
+                contents.any { it.contains("udfps", true) || it.contains("fod", true) || it.contains("hbm", true) }
+
+            items += ExtractableFileItem(
+                id = "ext_rro_${pkg.hashCode()}",
+                category = "RRO_OVERLAY_APK",
+                title = pkg,
+                romFilePath = apkPath ?: (if (language == AppLanguage.FR) "Non résolu dans ce ZIP ($pkg — relancer ANALYSE v2)" else "Unresolved in legacy ZIP ($pkg)"),
+                romDirectory = dir ?: "/product/overlay ou /system_ext/overlay",
+                targetGsiPath = targetPath,
+                importantElements = contents.distinct(),
+                missingMechanism = if (language == AppLanguage.FR) {
+                    "Fournit la surcharge RRO active vers ${deep?.targetPackage?.ifBlank { "SystemUI/Framework" } ?: "SystemUI/Framework"} (coordonnées capteur UDFPS, nœud sysfs/HBM, booléens config_udfps*)."
+                } else {
+                    "Provides active RRO overrides for ${deep?.targetPackage?.ifBlank { "SystemUI/Framework" } ?: "SystemUI/Framework"} (UDFPS sensor props, HBM sysfs node, config_udfps* booleans)."
+                },
+                gsiCurrentState = d.gsiEvidence,
+                priorityPercent = if (isCoreFodOrSysUi) 96 else 82,
+                canExtractWithoutVendorOrBoot = true
+            )
+        }
+
+        // 2. .prop provenance files containing missing/divergent FOD/Display properties
+        val romPropFiles = romProvenance.filter { it.category == "PROP_FILE" }
+        val propDiffs = diffs.filter { it.category == "PROPERTIES (getprop)" && (it.status == EvidenceStatus.FAILED || it.status == EvidenceStatus.SUSPECT) }
+        if (propDiffs.isNotEmpty()) {
+            if (romPropFiles.isNotEmpty()) {
+                romPropFiles.forEach { pf ->
+                    val matchingDiffs = propDiffs.filter { d ->
+                        pf.importantContents.any { line -> line.contains(d.title) }
+                    }
+                    if (matchingDiffs.isNotEmpty() || pf.filePath.startsWith("/product") || pf.filePath.startsWith("/system")) {
+                        val important = (matchingDiffs.map { "${it.romEvidence} (GSI: ${it.gsiEvidence})" } + pf.importantContents).distinct().take(18)
+                        val targetGsi = if (pf.filePath.startsWith("/vendor") || pf.filePath.startsWith("/odm")) {
+                            "/system_ext/etc/build.prop (ou Magisk system.prop — vendor/boot intacts)"
+                        } else {
+                            pf.filePath
+                        }
+                        items += ExtractableFileItem(
+                            id = "ext_prop_${pf.filePath.hashCode()}",
+                            category = "PROP_FILE",
+                            title = pf.filePath.substringAfterLast('/'),
+                            romFilePath = pf.filePath,
+                            romDirectory = pf.directory,
+                            targetGsiPath = targetGsi,
+                            importantElements = important,
+                            missingMechanism = if (language == AppLanguage.FR) {
+                                "Déclare les propriétés FOD / HBM / capteur optique manquantes ou divergentes côté GSI."
+                            } else {
+                                "Defines FOD / HBM / optical sensor system properties missing or divergent on GSI."
+                            },
+                            gsiCurrentState = "${matchingDiffs.size} prop(s) divergentes",
+                            priorityPercent = if (matchingDiffs.any { it.status == EvidenceStatus.FAILED }) 90 else 76,
+                            canExtractWithoutVendorOrBoot = true
+                        )
+                    }
+                }
+            } else {
+                // Legacy fallback: group missing critical properties even if exact .prop file wasn't indexed
+                val criticalProps = propDiffs.filter { it.status == EvidenceStatus.FAILED }.take(12)
+                if (criticalProps.isNotEmpty()) {
+                    items += ExtractableFileItem(
+                        id = "ext_prop_legacy",
+                        category = "PROP_FILE",
+                        title = "Propriétés système FOD/Display manquantes",
+                        romFilePath = "raw/getprop_all.txt (index .prop non capturé dans ce ZIP)",
+                        romDirectory = "/product/etc/build.prop / /system_ext/etc/build.prop",
+                        targetGsiPath = "/product/etc/build.prop ou module Magisk system.prop",
+                        importantElements = criticalProps.map { "${it.romEvidence} [GSI=${it.gsiEvidence}]" },
+                        missingMechanism = if (language == AppLanguage.FR) {
+                            "Propriétés actives sur Custom ROM absentes de la GSI."
+                        } else {
+                            "Active Custom ROM properties absent on GSI."
+                        },
+                        gsiCurrentState = "${criticalProps.size} prop(s) [FAILED]",
+                        priorityPercent = 86,
+                        canExtractWithoutVendorOrBoot = true
+                    )
+                }
+            }
+        }
+
+        // 3. Init.rc files on system/product/system_ext (or triggers from raw/init_rc_snippets.txt)
+        val rInitRaw = readRaw(romZip, "raw/init_rc_snippets.txt")
+        val gInitRaw = readRaw(gsiZip, "raw/init_rc_snippets.txt")
+        val gInitLines = gInitRaw.lines().map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        val romInitByFile = rInitRaw.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("/") && it.contains(":") && it !in gInitLines }
+            .groupBy { it.substringBefore(":") }
+
+        romInitByFile.entries.take(10).forEach { (rcPath, lines) ->
+            val cleanLines = lines.map { it.substringAfter(":").trim() }.distinct().take(15)
+            val isSystemSide = rcPath.startsWith("/system") || rcPath.startsWith("/product") || rcPath.startsWith("/system_ext")
+            items += ExtractableFileItem(
+                id = "ext_rc_${rcPath.hashCode()}",
+                category = "INIT_RC",
+                title = rcPath.substringAfterLast('/'),
+                romFilePath = rcPath,
+                romDirectory = rcPath.substringBeforeLast('/'),
+                targetGsiPath = if (isSystemSide) rcPath else "/system_ext/etc/init/fod_port_triggers.rc (sans toucher /vendor)",
+                importantElements = cleanLines,
+                missingMechanism = if (language == AppLanguage.FR) {
+                    "Initialise permissions sysfs FOD/HBM/Touch (chown/chmod), propriétés boot ou démons auxiliaires."
+                } else {
+                    "Initializes FOD/HBM/Touch sysfs permissions (chown/chmod), boot props, or helper services."
+                },
+                gsiCurrentState = "Règles absentes sur GSI",
+                priorityPercent = if (isSystemSide) 88 else 68,
+                canExtractWithoutVendorOrBoot = true
+            )
+        }
+
+        // 4. Permissions / Sysconfig / DisplayConfig XML + SELinux policy files from FileProvenanceArtifact
+        val gsiProvPaths = gsiProvenance.map { it.filePath }.toHashSet()
+        romProvenance
+            .filter { it.category in setOf("PERMISSIONS_XML", "DISPLAY_CONFIG", "SELINUX_POLICY") }
+            .forEach { item ->
+                val missingOnGsi = item.filePath !in gsiProvPaths
+                if (!missingOnGsi) return@forEach
+                val isSysSide = !item.filePath.startsWith("/vendor/") && !item.filePath.startsWith("/odm/")
+                val targetGsi = if (isSysSide) item.filePath else when (item.category) {
+                    "DISPLAY_CONFIG" -> "/product/etc/displayconfig/${item.filePath.substringAfterLast('/')}"
+                    "SELINUX_POLICY" -> "/system_ext/etc/selinux/${item.filePath.substringAfterLast('/')}"
+                    else -> "/product/etc/permissions/${item.filePath.substringAfterLast('/')}"
+                }
+                items += ExtractableFileItem(
+                    id = "ext_prov_${item.id.hashCode()}",
+                    category = item.category,
+                    title = item.filePath.substringAfterLast('/'),
+                    romFilePath = item.filePath,
+                    romDirectory = item.directory,
+                    targetGsiPath = targetGsi,
+                    importantElements = item.importantContents.take(15),
+                    missingMechanism = when (item.category) {
+                        "DISPLAY_CONFIG" -> if (language == AppLanguage.FR) "Profil écran HBM / luminosité haute / seuils lux requis pour illumination FOD." else "Panel HBM / high-brightness displayconfig profile required for FOD illumination."
+                        "SELINUX_POLICY" -> if (language == AppLanguage.FR) "Règles/contextes SELinux autorisant l'accès SystemUI/Framework aux nœuds sysfs & Binder HAL." else "SELinux policy/contexts allowing SystemUI/Framework access to sysfs & HAL Binder."
+                        else -> if (language == AppLanguage.FR) "Déclaration XML de fonctionnalité biométrique / sysconfig / permission système." else "System biometric feature / sysconfig / permission XML declaration."
+                    },
+                    gsiCurrentState = if (isSysSide) "Absent sur GSI" else "Référence vendor intacte à miroiter côté système",
+                    priorityPercent = if (isSysSide) 84 else 62,
+                    canExtractWithoutVendorOrBoot = true
+                )
+            }
+
+        // 5. SystemUI / Framework JAR/APK provenance when live callbacks / HBM transition stall
+        val hasStallOrCallbackLoss = diffs.any {
+            it.category == "LIVE LOGCAT CALLBACKS" ||
+                (it.category == "LIVE EXECUTION & SYSFS" && (it.title.contains("HAL", true) || it.title.contains("Sysfs", true)))
+        }
+        val sysUiProv = romProvenance.filter { it.category == "SYSTEMUI_FRAMEWORK" }
+        if (hasStallOrCallbackLoss && sysUiProv.isNotEmpty()) {
+            sysUiProv.take(3).forEach { sp ->
+                items += ExtractableFileItem(
+                    id = "ext_sysfw_${sp.id.hashCode()}",
+                    category = "SYSTEMUI_FRAMEWORK",
+                    title = sp.filePath.substringAfterLast('/'),
+                    romFilePath = sp.filePath,
+                    romDirectory = sp.directory,
+                    targetGsiPath = "${sp.filePath} (adapter UdfpsController / UdfpsDisplayMode / pont extCmd côté GSI)",
+                    importantElements = sp.importantContents.take(18),
+                    missingMechanism = if (language == AppLanguage.FR) {
+                        "Contient le pont exact UdfpsHandler / HBM / extension vendor (extCmd/onFingerDown) manquant dans le binaire GSI."
+                    } else {
+                        "Contains exact UdfpsHandler / HBM / vendor extension bridge (extCmd/onFingerDown) missing in GSI binary."
+                    },
+                    gsiCurrentState = "Appels callbacks/HBM absents pendant l'enrôlement GSI",
+                    priorityPercent = 92,
+                    canExtractWithoutVendorOrBoot = true
+                )
+            }
+        }
+
+        return items
+            .distinctBy { "${it.category}::${it.romFilePath}::${it.title}" }
+            .sortedByDescending { it.priorityPercent }
+    }
+
     private fun buildRankedPortingSolutions(
         romZip: RawZipArchiveBundle,
         gsiZip: RawZipArchiveBundle,
         diffs: List<PortFileDiffItem>,
+        extractables: List<ExtractableFileItem>,
         language: AppLanguage
     ): List<PortingCandidateSolution> {
         val solutions = mutableListOf<PortingCandidateSolution>()
@@ -542,6 +937,7 @@ object PortAnalysisEngine {
         val propDiffs = diffs.filter { it.category == "PROPERTIES (getprop)" }
         if (propDiffs.isNotEmpty()) {
             val missingPhhOrFod = propDiffs.filter { it.status == EvidenceStatus.FAILED }
+            val propFiles = extractables.filter { it.category == "PROP_FILE" }
             solutions += PortingCandidateSolution(
                 id = "port_tier1_props",
                 tier = PortingTier.PROPS_PHH_TREBLE,
@@ -559,12 +955,12 @@ object PortAnalysisEngine {
                 } else {
                     "${propDiffs.size} FOD/display/biometric properties diverge in raw/getprop_all.txt between ROM and GSI."
                 },
-                exactSourcesInZip = propDiffs.take(8).map { "raw/getprop_all.txt -> ${it.title}: ROM=${it.romEvidence} | GSI=${it.gsiEvidence}" },
+                exactSourcesInZip = (propFiles.map { "${it.romFilePath} -> ${it.importantElements.take(3)}" } + propDiffs.take(6).map { "raw/getprop_all.txt -> ${it.title}: ROM=${it.romEvidence} | GSI=${it.gsiEvidence}" }).distinct().take(8),
                 concreteActionSteps = propDiffs.filter { it.romEvidence.contains("=") }.take(6).map {
                     "Aligner côté /system_ext ou Magisk/resetprop : ${it.romEvidence}"
                 }.ifEmpty {
                     listOf(
-                        if (language == AppLanguage.FR) "Comparer chaque propriété divergente de raw/getprop_all.txt et aligner côté /product ou Treble Settings."
+                        if (language == AppLanguage.FR) "Comparer chaque propriété divergente de raw/getprop_all.txt et aligner côté /product props ou Treble Settings."
                         else "Align divergent properties from raw/getprop_all.txt via /product props or Treble Settings."
                     )
                 },
@@ -576,44 +972,55 @@ object PortAnalysisEngine {
             )
         }
 
-        // Tier 2: RRO Overlays + Init.rc + System SELinux (still zero Framework/SystemUI Java recompile!)
+        // Tier 2: RRO Overlays + Init.rc + System SELinux + Permissions/DisplayConfig XML (still zero Framework/SystemUI Java recompile!)
         val rroDiffs = diffs.filter { it.category == "RRO OVERLAYS" }
         val initDiffs = diffs.filter { it.category == "INIT.RC TRIGGERS" }
         val selinuxDiffs = diffs.filter { it.category == "SELINUX AVC (GSI-ONLY)" }
-        if (rroDiffs.isNotEmpty() || initDiffs.isNotEmpty() || selinuxDiffs.isNotEmpty()) {
-            val sources = (rroDiffs + initDiffs + selinuxDiffs).take(8).map { "${it.sourceFile} -> ${it.title}" }
+        val provDiffs = diffs.filter { it.category.startsWith("FILE PROVENANCE") }
+        val rroExtractables = extractables.filter { it.category == "RRO_OVERLAY_APK" }
+        if (rroDiffs.isNotEmpty() || initDiffs.isNotEmpty() || selinuxDiffs.isNotEmpty() || provDiffs.isNotEmpty()) {
+            val sources = (
+                rroExtractables.map { "${it.romFilePath} (dir=${it.romDirectory})" } +
+                    (rroDiffs + initDiffs + selinuxDiffs + provDiffs).map { "${it.sourceFile} -> ${it.title}" }
+                ).distinct().take(10)
             solutions += PortingCandidateSolution(
                 id = "port_tier2_rro_selinux",
                 tier = PortingTier.RRO_INIT_SELINUX_SYSTEM,
                 rank = rank++,
                 title = if (language == AppLanguage.FR) {
-                    "Niveau 2 : Portage des overlays RRO actifs, triggers init système & contexte SELinux"
+                    "Niveau 2 : Extraire overlays RRO exacts, XML display/permissions, triggers init & SELinux système"
                 } else {
-                    "Tier 2: Port active RRO overlays, system init triggers & system SELinux rules"
+                    "Tier 2: Extract exact RRO overlays, display/permissions XMLs, init triggers & system SELinux rules"
                 },
                 layer = "RRO Overlay (/product/overlay) + system_ext/etc/init + sepolicy système",
                 requiresFrameworkOrSystemUi = false,
-                confidencePercent = if (rroDiffs.any { it.status == EvidenceStatus.FAILED } || selinuxDiffs.isNotEmpty()) 85 else 55,
+                confidencePercent = if (rroDiffs.any { it.status == EvidenceStatus.FAILED } || selinuxDiffs.isNotEmpty()) 88 else 58,
                 whyItApplies = if (language == AppLanguage.FR) {
-                    "Les ZIP prouvent ${rroDiffs.size} écart(s) d'overlay RRO actif, ${initDiffs.size} écart(s) init.rc et ${selinuxDiffs.size} refus AVC propres à la GSI."
+                    "Les archives identifient ${rroDiffs.size} écart(s) d'overlay RRO actif (${rroExtractables.count { !it.romFilePath.startsWith("Non") }} APK localisé(s)), ${initDiffs.size} écart(s) init.rc, ${provDiffs.size} fichier(s) système et ${selinuxDiffs.size} refus AVC GSI."
                 } else {
-                    "ZIPs prove ${rroDiffs.size} active RRO overlay diffs, ${initDiffs.size} init.rc diffs, and ${selinuxDiffs.size} GSI-only AVC denials."
+                    "Archives pinpoint ${rroDiffs.size} active RRO overlay diffs, ${initDiffs.size} init.rc diffs, ${provDiffs.size} system file diffs, and ${selinuxDiffs.size} GSI-only AVC denials."
                 },
                 exactSourcesInZip = sources,
-                concreteActionSteps = listOfNotNull(
-                    rroDiffs.firstOrNull()?.let {
-                        if (language == AppLanguage.FR) "Porter l'overlay RRO actif sur ROM (${it.title}) dans /product/overlay/ côté GSI (coordonnées UDFPS, HBM, config_biometric_sensors)."
-                        else "Port ROM-active RRO overlay (${it.title}) to GSI /product/overlay/ (UDFPS coords, HBM, config_biometric_sensors)."
-                    },
-                    selinuxDiffs.firstOrNull()?.let {
-                        if (language == AppLanguage.FR) "Autoriser dans plat_sepolicy / system_ext les accès refusés uniquement sur GSI (raw/selinux_denials.txt)."
-                        else "Allow GSI-only denied contexts in plat_sepolicy / system_ext (raw/selinux_denials.txt)."
-                    },
-                    initDiffs.firstOrNull()?.let {
-                        if (language == AppLanguage.FR) "Reproduire côté /system/etc/init/ les permissions/démarrages manquants observés dans raw/init_rc_snippets.txt."
-                        else "Mirror missing init triggers observed in raw/init_rc_snippets.txt under /system/etc/init/."
+                concreteActionSteps = buildList {
+                    rroExtractables.take(3).forEach { ov ->
+                        add(
+                            if (language == AppLanguage.FR) "Extraire depuis Custom ROM `${ov.romFilePath}` (répertoire `${ov.romDirectory}`) vers `${ov.targetGsiPath}`."
+                            else "Extract `${ov.romFilePath}` from Custom ROM (dir `${ov.romDirectory}`) to GSI `${ov.targetGsiPath}`."
+                        )
                     }
-                ),
+                    extractables.filter { it.category in setOf("INIT_RC", "DISPLAY_CONFIG", "PERMISSIONS_XML", "SELINUX_POLICY") }.take(4).forEach { ex ->
+                        add(
+                            if (language == AppLanguage.FR) "Porter `[${ex.category}]` depuis `${ex.romFilePath}` vers `${ex.targetGsiPath}`."
+                            else "Port `[${ex.category}]` from `${ex.romFilePath}` to `${ex.targetGsiPath}`."
+                        )
+                    }
+                    if (isEmpty() && rroDiffs.isNotEmpty()) {
+                        add(
+                            if (language == AppLanguage.FR) "Porter l'overlay RRO actif (${rroDiffs.first().title}) dans /product/overlay/ côté GSI."
+                            else "Port active RRO overlay (${rroDiffs.first().title}) into GSI /product/overlay/."
+                        )
+                    }
+                },
                 limitations = if (language == AppLanguage.FR) {
                     "Garde boot et vendor 100 % intacts et ne recompile pas le Framework, mais ne crée pas de nouveau callback JNI/HIDL s'il est codé en dur dans SystemUI."
                 } else {
@@ -626,6 +1033,7 @@ object PortAnalysisEngine {
         val liveOrDumpsysDiffs = diffs.filter {
             it.category == "LIVE EXECUTION & SYSFS" ||
                 it.category == "DUMPSYS SERVICES" ||
+                it.category == "DISPLAY / HBM PIPELINE" ||
                 it.category == "LIVE LOGCAT CALLBACKS"
         }
         if (liveOrDumpsysDiffs.isNotEmpty()) {
@@ -636,6 +1044,7 @@ object PortAnalysisEngine {
                     it.title.contains("SurfaceFlinger", true) ||
                     it.title.contains("display", true)
             }
+            val sysUiFiles = extractables.filter { it.category == "SYSTEMUI_FRAMEWORK" }
             solutions += PortingCandidateSolution(
                 id = "port_tier3_sysui_udfps",
                 tier = PortingTier.SYSTEMUI_UDFPS,
@@ -653,7 +1062,7 @@ object PortAnalysisEngine {
                 } else {
                     "Live traces prove FOD UI illuminates on GSI yet HBM/Touch hardware state transition or onFingerDown/extCmd diverges from Custom ROM."
                 },
-                exactSourcesInZip = liveOrDumpsysDiffs.take(8).map { "${it.sourceFile} -> ${it.title}" },
+                exactSourcesInZip = (sysUiFiles.map { "${it.romFilePath} -> ${it.importantElements.take(4)}" } + liveOrDumpsysDiffs.take(8).map { "${it.sourceFile} -> ${it.title}" }).distinct().take(10),
                 concreteActionSteps = listOf(
                     if (language == AppLanguage.FR) "Implémenter ou corriger le hook UdfpsHandler/PhhFod pour déclencher exactement le même état sysfs/DRM (disp_param/fod_status) observé sur Custom ROM."
                     else "Hook UdfpsHandler/PhhFod in GSI SystemUI to toggle the exact sysfs/DRM state (disp_param/fod_status) observed on Custom ROM.",
@@ -668,7 +1077,7 @@ object PortAnalysisEngine {
             )
         }
 
-        // Tier 4: Framework / BiometricService / Vendor HAL Extension Interface (when lshal/vintf/ELF show vendor extensions)
+        // Tier 4: Framework / BiometricService / Vendor HAL Extension Interface
         val halOrElfDiffs = diffs.filter { it.category == "HAL / VINTF / BINDER" || it.category == "ELF BINARIES & SYMBOLS" }
         if (halOrElfDiffs.isNotEmpty() || gsiZip.report?.summary?.enrollmentSucceeded == false) {
             solutions += PortingCandidateSolution(
@@ -711,15 +1120,21 @@ object PortAnalysisEngine {
         gsiZip: RawZipArchiveBundle,
         diffs: List<PortFileDiffItem>,
         solutions: List<PortingCandidateSolution>,
+        extractables: List<ExtractableFileItem>,
         language: AppLanguage
     ): String {
         val blockingCount = diffs.count { it.status == EvidenceStatus.FAILED }
         val topSol = solutions.maxByOrNull { it.confidencePercent } ?: solutions.firstOrNull()
         val liveBreaks = diffs.filter { it.category == "LIVE EXECUTION & SYSFS" || it.category == "LIVE LOGCAT CALLBACKS" }
+        val topExtract = extractables.firstOrNull()
         return if (language == AppLanguage.FR) {
             buildString {
                 appendLine("Archives analysées intégralement : ${romZip.totalFiles} fichiers ROM (${romZip.totalBytes / 1024} Ko) vs ${gsiZip.totalFiles} fichiers GSI (${gsiZip.totalBytes / 1024} Ko).")
                 appendLine("$blockingCount divergence(s) critique(s) [FAILED] identifiée(s) sur des éléments qui fonctionnent sur la Custom ROM.")
+                appendLine("${extractables.size} fichier(s)/mécanisme(s) concret(s) identifié(s) pour extraction depuis la Custom ROM.")
+                if (topExtract != null) {
+                    appendLine("Fichier prioritaire à extraire (${topExtract.priorityPercent}%) : ${topExtract.romFilePath} (Rép: ${topExtract.romDirectory} -> GSI: ${topExtract.targetGsiPath}).")
+                }
                 if (liveBreaks.isNotEmpty()) {
                     appendLine("Point de blocage live prouvé : ${liveBreaks.first().title} (${liveBreaks.first().sourceFile}).")
                 }
@@ -731,6 +1146,10 @@ object PortAnalysisEngine {
             buildString {
                 appendLine("Full archives inspected: ${romZip.totalFiles} ROM files (${romZip.totalBytes / 1024} KB) vs ${gsiZip.totalFiles} GSI files (${gsiZip.totalBytes / 1024} KB).")
                 appendLine("$blockingCount critical [FAILED] divergence(s) found on mechanisms working in Custom ROM.")
+                appendLine("${extractables.size} actionable file(s)/mechanism(s) identified for Custom ROM extraction.")
+                if (topExtract != null) {
+                    appendLine("Top file to extract (${topExtract.priorityPercent}%): ${topExtract.romFilePath} (Dir: ${topExtract.romDirectory} -> GSI: ${topExtract.targetGsiPath}).")
+                }
                 if (liveBreaks.isNotEmpty()) {
                     appendLine("Proven live block: ${liveBreaks.first().title} (${liveBreaks.first().sourceFile}).")
                 }
@@ -739,6 +1158,134 @@ object PortAnalysisEngine {
                 }
             }.trim()
         }
+    }
+
+    private fun loadOverlayInspections(zip: RawZipArchiveBundle): Map<String, OverlayDeepInspection> {
+        val out = LinkedHashMap<String, OverlayDeepInspection>()
+        zip.report?.overlayInspections?.forEach { out[it.packageName] = it }
+        val raw = readRaw(zip, "raw/overlay_deep_inspect.txt")
+        if (raw.isNotBlank()) {
+            parseOverlayInspectText(raw).forEach { ov ->
+                if (!out.containsKey(ov.packageName) || out[ov.packageName]?.apkPath == "UNKNOWN") {
+                    out[ov.packageName] = ov
+                }
+            }
+        }
+        return out
+    }
+
+    internal fun parseOverlayInspectText(raw: String): List<OverlayDeepInspection> {
+        if (raw.isBlank()) return emptyList()
+        val list = mutableListOf<OverlayDeepInspection>()
+        var pkg = ""
+        var enabled = false
+        var isStatic = false
+        var priority = 0
+        var target = ""
+        var apkPath = "UNKNOWN"
+        var dir = "UNKNOWN"
+        val manifest = mutableListOf<String>()
+        val configs = mutableListOf<String>()
+
+        fun flush() {
+            if (pkg.isBlank()) return
+            list += OverlayDeepInspection(
+                packageName = pkg,
+                targetPackage = target,
+                apkPath = apkPath,
+                directory = dir,
+                isEnabled = enabled,
+                isStatic = isStatic,
+                priority = priority,
+                manifestSummary = manifest.toList(),
+                fodConfigEntries = configs.toList()
+            )
+        }
+
+        for (line in raw.lineSequence()) {
+            val t = line.trim()
+            if (t.startsWith("OVERLAY:")) {
+                flush()
+                pkg = t.removePrefix("OVERLAY:").trim()
+                enabled = false; isStatic = false; priority = 0; target = ""
+                apkPath = "UNKNOWN"; dir = "UNKNOWN"
+                manifest.clear(); configs.clear()
+            } else if (t.startsWith("ENABLED=")) {
+                enabled = t.contains("ENABLED=true", true)
+                isStatic = t.contains("STATIC=true", true)
+                priority = Regex("PRIORITY=(\\d+)").find(t)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                target = Regex("TARGET=([^|\\s]*)").find(t)?.groupValues?.get(1).orEmpty()
+            } else if (t.startsWith("APK_PATH=")) {
+                apkPath = t.removePrefix("APK_PATH=").trim()
+            } else if (t.startsWith("DIRECTORY=")) {
+                dir = t.removePrefix("DIRECTORY=").trim()
+            } else if (t.startsWith("MANIFEST:")) {
+                manifest += t.removePrefix("MANIFEST:").trim()
+            } else if (t.startsWith("CONTENT:")) {
+                configs += t.removePrefix("CONTENT:").trim()
+            }
+        }
+        flush()
+        return list
+    }
+
+    private fun loadFileProvenance(zip: RawZipArchiveBundle): List<FileProvenanceArtifact> {
+        val list = zip.report?.fileProvenance.orEmpty().toMutableList()
+        val raw = readRaw(zip, "raw/file_provenance_index.txt")
+        if (raw.isNotBlank()) {
+            val parsed = parseFileProvenanceText(raw)
+            val existingKeys = list.map { "${it.category}::${it.filePath}" }.toHashSet()
+            parsed.forEach { p ->
+                if ("${p.category}::${p.filePath}" !in existingKeys) {
+                    list += p
+                }
+            }
+        }
+        return list
+    }
+
+    internal fun parseFileProvenanceText(raw: String): List<FileProvenanceArtifact> {
+        if (raw.isBlank()) return emptyList()
+        val out = mutableListOf<FileProvenanceArtifact>()
+        var cat = ""
+        var path = ""
+        var dir = ""
+        var key = ""
+        var note: String? = null
+        val details = mutableListOf<String>()
+
+        fun flush() {
+            if (path.isBlank()) return
+            out += FileProvenanceArtifact(
+                id = "parsed_${out.size}_${path.hashCode()}",
+                category = cat.ifBlank { "UNKNOWN" },
+                filePath = path,
+                directory = dir.ifBlank { path.substringBeforeLast('/', "UNKNOWN") },
+                matchedSymbolOrKey = key,
+                importantContents = details.toList(),
+                accessNote = note
+            )
+        }
+
+        for (line in raw.lineSequence()) {
+            val t = line.trim()
+            if (t.startsWith("FILE: [")) {
+                flush()
+                cat = t.substringAfter("FILE: [").substringBefore("]")
+                path = t.substringAfter("]").trim()
+                dir = ""; key = ""; note = null; details.clear()
+            } else if (t.startsWith("DIRECTORY=")) {
+                dir = t.removePrefix("DIRECTORY=").trim()
+            } else if (t.startsWith("KEY=")) {
+                key = t.removePrefix("KEY=").trim()
+            } else if (t.startsWith("DETAIL:")) {
+                details += t.removePrefix("DETAIL:").trim()
+            } else if (t.startsWith("NOTE:")) {
+                note = t.removePrefix("NOTE:").trim()
+            }
+        }
+        flush()
+        return out
     }
 
     private fun readRaw(zip: RawZipArchiveBundle, path: String): String =

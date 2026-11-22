@@ -8,6 +8,8 @@ import android.os.Build
 import android.os.Environment
 import android.view.Display
 import com.example.model.EnvironmentSnapshot
+import com.example.model.FileProvenanceArtifact
+import com.example.model.OverlayDeepInspection
 import com.example.model.SysfsTransition
 import java.io.File
 import java.text.SimpleDateFormat
@@ -35,7 +37,11 @@ data class BaselineProbeResult(
     val discoveredSysfsPaths: List<String> = emptyList(),
     val baselineSysfsMap: Map<String, String> = emptyMap(),
     val baselineDmesgLines: List<String> = emptyList(),
-    val baselineSurfaceFlingerLayers: List<String> = emptyList()
+    val baselineSurfaceFlingerLayers: List<String> = emptyList(),
+    val overlayInspections: List<OverlayDeepInspection> = emptyList(),
+    val fileProvenance: List<FileProvenanceArtifact> = emptyList(),
+    val overlayDeepInspect: String = "",
+    val fileProvenanceIndex: String = ""
 )
 
 data class LivePollSnapshot(
@@ -173,7 +179,7 @@ class SystemProbeCollector(private val context: Context) {
 
         val initRcRes = if (effectiveRoot) {
             probeCommand(
-                "grep -rnE 'fingerprint|fod|udfps|hbm|lhbm|goodix|fpc|silead|focal|egis|synaptics' /vendor/etc/init /system/etc/init /system_ext/etc/init /product/etc/init 2>/dev/null | head -n 200",
+                "grep -rnE 'fingerprint|fod|udfps|hbm|lhbm|goodix|fpc|silead|focal|egis|synaptics|disp_param' /vendor/etc/init /odm/etc/init /system/etc/init /system_ext/etc/init /product/etc/init 2>/dev/null | head -n 220",
                 true,
                 accessLimitations
             )
@@ -206,6 +212,18 @@ class SystemProbeCollector(private val context: Context) {
         val bioStatus = queryBiometricHardwareStatus()
         val displaySummary = queryDisplayModesSummary()
         val overlayPackages = queryInstalledFodOverlays()
+
+        val provenanceBundle = DynamicProvenanceInspector.inspectAll(
+            context = context,
+            dumpsysOverlayList = dumpsysOverlay,
+            installedOverlayPackages = overlayPackages,
+            getpropAll = getpropAll,
+            initRcSnippets = initRcRes,
+            lshalOutput = lshalRes,
+            vintfManifests = vintfRes,
+            effectiveRoot = effectiveRoot,
+            accessLimitations = accessLimitations
+        )
 
         val bootSig = listOfNotNull(
             propMap["ro.bootimage.build.fingerprint"],
@@ -267,7 +285,11 @@ class SystemProbeCollector(private val context: Context) {
             discoveredSysfsPaths = discoveredSysfsPaths,
             baselineSysfsMap = sysfsMap,
             baselineDmesgLines = baselineDmesgLines,
-            baselineSurfaceFlingerLayers = baselineSfLayers
+            baselineSurfaceFlingerLayers = baselineSfLayers,
+            overlayInspections = provenanceBundle.overlayInspections,
+            fileProvenance = provenanceBundle.fileProvenance,
+            overlayDeepInspect = provenanceBundle.overlayDeepInspectText,
+            fileProvenanceIndex = provenanceBundle.fileProvenanceIndexText
         )
     }
 

@@ -124,6 +124,31 @@ data class EnvironmentSnapshot(
 )
 
 @JsonClass(generateAdapter = true)
+data class OverlayDeepInspection(
+    val packageName: String,
+    val targetPackage: String = "",
+    val apkPath: String = "UNKNOWN",
+    val directory: String = "UNKNOWN",
+    val isEnabled: Boolean = false,
+    val isStatic: Boolean = false,
+    val priority: Int = 0,
+    val manifestSummary: List<String> = emptyList(),
+    val fodConfigEntries: List<String> = emptyList(),
+    val rawDumpNote: String = ""
+)
+
+@JsonClass(generateAdapter = true)
+data class FileProvenanceArtifact(
+    val id: String,
+    val category: String,
+    val filePath: String,
+    val directory: String,
+    val matchedSymbolOrKey: String,
+    val importantContents: List<String> = emptyList(),
+    val accessNote: String? = null
+)
+
+@JsonClass(generateAdapter = true)
 data class RawArtifactsBundle(
     val logcatBaseline: String = "",
     val logcatEnrollment: String = "",
@@ -141,7 +166,9 @@ data class RawArtifactsBundle(
     val initRcSnippets: String = "",
     val elfDisassemblyFull: String = "",
     val dmesgDelta: String = "",
-    val surfaceFlingerLiveDelta: String = ""
+    val surfaceFlingerLiveDelta: String = "",
+    val overlayDeepInspect: String = "",
+    val fileProvenanceIndex: String = ""
 )
 
 @JsonClass(generateAdapter = true)
@@ -205,7 +232,9 @@ data class FodDiagnosticReport(
     val summary: DiagnosticSummary,
     val rawArtifacts: RawArtifactsBundle,
     val fingerDownChain: List<FingerDownStep> = emptyList(),
-    val sysfsTransitions: List<SysfsTransition> = emptyList()
+    val sysfsTransitions: List<SysfsTransition> = emptyList(),
+    val overlayInspections: List<OverlayDeepInspection> = emptyList(),
+    val fileProvenance: List<FileProvenanceArtifact> = emptyList()
 )
 
 @JsonClass(generateAdapter = true)
