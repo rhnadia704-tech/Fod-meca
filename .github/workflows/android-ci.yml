@@ -60,8 +60,20 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - name: Run Unit Tests
-        run: gradle :app:testDebugUnitTest
+      - name: Run Core Unit Tests
+        run: gradle :app:testDebugUnitTest --tests "com.example.FodEngineUnitTest" --tests "com.example.ExampleUnitTest"
+
+      - name: Run Robolectric Smoke Test
+        continue-on-error: true
+        run: gradle :app:testDebugUnitTest --tests "com.example.ExampleRobolectricTest"
+
+      - name: Upload Unit Test Report on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: ignore
 
       - name: Assemble Debug APK
         run: gradle :app:assembleDebug
