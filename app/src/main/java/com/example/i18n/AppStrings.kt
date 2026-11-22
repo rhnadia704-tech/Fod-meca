@@ -154,7 +154,14 @@ data class AppStrings(
     val sysfsTransitionsTitle: String,
     val compTrueGsiBlockers: String,
     val compSharedNonBlockers: String,
-    val aiLocalFallbackNotice: String
+    val aiLocalFallbackNotice: String,
+    val provenFodBadge: String,
+    val liveProcMapsBadge: String,
+    val lookupWinnerBadge: String,
+    val procLiveMapsTitle: String,
+    val dexSourceExtractTitle: String,
+    val pseudoXmlAndArscTitle: String,
+    val arscScoreLabel: String
 )
 
 val FrenchStrings = AppStrings(
@@ -294,7 +301,14 @@ val FrenchStrings = AppStrings(
     sysfsTransitionsTitle = "Transitions sysfs FOD/HBM/Touch (Avant → Pendant → Après)",
     compTrueGsiBlockers = "Vrais Bloqueurs GSI",
     compSharedNonBlockers = "Bruit partagé (Absent/KO sur les 2)",
-    aiLocalFallbackNotice = "IA Cloud indisponible (aucun google-services.json actif et aucune clé API Gemini personnelle configurée dans Paramètres). Synthèse forensique locale générée ci-dessous :"
+    aiLocalFallbackNotice = "IA Cloud indisponible (aucun google-services.json actif et aucune clé API Gemini personnelle configurée dans Paramètres). Synthèse forensique locale générée ci-dessous :",
+    provenFodBadge = "CONTRIBUTEUR FOD PROUVÉ",
+    liveProcMapsBadge = "MAPPÉ /proc LIVE",
+    lookupWinnerBadge = "GAGNANT LOOKUP",
+    procLiveMapsTitle = "Processus FOD actifs (/proc/<pid>/maps & fd)",
+    dexSourceExtractTitle = "Extraction Code Source DEX (Classes & Méthodes)",
+    pseudoXmlAndArscTitle = "Code Source Décodé (Pseudo-XML & ARSC)",
+    arscScoreLabel = "Score FOD"
 )
 
 val EnglishStrings = AppStrings(
@@ -434,7 +448,14 @@ val EnglishStrings = AppStrings(
     sysfsTransitionsTitle = "FOD/HBM/Touch Sysfs Transitions (Before → During → After)",
     compTrueGsiBlockers = "True GSI Blockers",
     compSharedNonBlockers = "Shared Noise (Missing/KO on Both)",
-    aiLocalFallbackNotice = "Cloud AI unavailable (no active google-services.json and no personal Gemini API key set in Settings). Local forensic synthesis generated below:"
+    aiLocalFallbackNotice = "Cloud AI unavailable (no active google-services.json and no personal Gemini API key set in Settings). Local forensic synthesis generated below:",
+    provenFodBadge = "PROVEN FOD CONTRIBUTOR",
+    liveProcMapsBadge = "PROVEN LIVE /proc",
+    lookupWinnerBadge = "LOOKUP WINNER",
+    procLiveMapsTitle = "Live Active FOD Processes (/proc/<pid>/maps & fd)",
+    dexSourceExtractTitle = "DEX Source-Level Extract (Classes & Methods)",
+    pseudoXmlAndArscTitle = "Decoded Source (Pseudo-XML & ARSC)",
+    arscScoreLabel = "FOD Score"
 )
 
 val LocalAppStrings = staticCompositionLocalOf { FrenchStrings }

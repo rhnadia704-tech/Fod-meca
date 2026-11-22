@@ -120,7 +120,7 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
 
                 val effectiveRoot = baseline.environment.rootGranted
                 val elfList = mutableListOf<ElfBinaryAnalysis>()
-                for (path in baseline.discoveredBinaryPaths.take(18)) {
+                for (path in baseline.discoveredBinaryPaths.take(24)) {
                     val readRes = ShellExecutor.readBinaryFile(path, effectiveRoot)
                     elfList += ElfDisassembler.analyzeBinary(path, readRes.bytes, readRes.accessError)
                 }
@@ -192,7 +192,9 @@ class DiagnosticViewModel(application: Application) : AndroidViewModel(applicati
                     language = language,
                     dmesgDelta = finalDiff.dmesgDelta,
                     surfaceFlingerLiveDelta = finalDiff.surfaceFlingerLiveDelta,
-                    sysfsTransitions = finalDiff.sysfsTransitions
+                    sysfsTransitions = finalDiff.sysfsTransitions,
+                    procLiveMaps = finalDiff.procLiveMaps,
+                    procLiveMapsText = finalDiff.procLiveMapsText
                 )
                 sessionRepo.saveLatestReport(report)
                 _currentReport.value = report

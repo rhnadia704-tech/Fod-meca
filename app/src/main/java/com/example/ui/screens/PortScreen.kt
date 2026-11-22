@@ -63,6 +63,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -717,10 +718,38 @@ private fun ExtractableFileCard(
                 )
             }
             AnimatedVisibility(visible = expanded) {
-                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                val codeLines = remember(item.importantElements) {
+                    item.importantElements.filter { line ->
+                        line.startsWith("ARSC ") ||
+                            line.startsWith("CLASS:") ||
+                            line.startsWith("METHOD:") ||
+                            line.startsWith("LOOKUP") ||
+                            line.startsWith("<") ||
+                            line.startsWith("SCORE=") ||
+                            line.startsWith("---") ||
+                            line.startsWith("XML:")
+                    }
+                }
+                val noteLines = remember(item.importantElements, codeLines) {
+                    item.importantElements.filter { it !in codeLines }
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
-                    item.importantElements.forEach { line ->
+                    noteLines.forEach { line ->
                         Text("• $line", style = MaterialTheme.typography.labelSmall)
+                    }
+                    if (codeLines.isNotEmpty()) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = codeLines.joinToString("\n"),
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                modifier = Modifier.padding(8.dp)
+                            )
+                        }
                     }
                 }
             }

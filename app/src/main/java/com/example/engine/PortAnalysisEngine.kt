@@ -1,6 +1,7 @@
 package com.example.engine
 
 import com.example.i18n.AppLanguage
+import com.example.model.DexSourceExtract
 import com.example.model.EvidenceStatus
 import com.example.model.ExtractableFileItem
 import com.example.model.FileProvenanceArtifact
@@ -26,6 +27,10 @@ object PortAnalysisEngine {
     private val avcPermRegex = Regex("\\{[^}]+\\}")
     private val avcTclassRegex = Regex("tclass=\\S+")
     private val avcScontextRegex = Regex("scontext=u:r:([^:]+):")
+    private val fodArscSignalRegex = Regex(
+        "(fod|udfps|fingerprint|biometric|hbm|lhbm|dimlayer|doze|burn_in|illumination|optical|ultrasonic|goodix|fpc|silead|focal|egis|synaptics|disp_param|touch_dev|xiaomi|oplus|phh|treble|sensor)",
+        RegexOption.IGNORE_CASE
+    )
 
     fun analyze(
         romZip: RawZipArchiveBundle,
@@ -74,6 +79,9 @@ object PortAnalysisEngine {
 
         // 7. ELF binaries & disassembly diff
         diffElfDisassembly(romZip, gsiZip, factualDiffs, language)
+
+        // 8. Live root /proc/<pid>/maps + /proc/<pid>/fd and DEX source-level hooks diff
+        diffLiveProcMapsAndDexSources(romZip, gsiZip, factualDiffs, language)
 
         val sortedDiffs = factualDiffs
             .distinctBy { "${it.sourceFile}::${it.title}" }
@@ -237,12 +245,26 @@ object PortAnalysisEngine {
         val gsiLines = parseOverlayStates(readRaw(gsiZip, "raw/dumpsys_overlay.txt"))
         val allNames = (romLines.keys + gsiLines.keys + romOverlays.keys + gsiOverlays.keys).distinct()
 
+        val romDeepScannedFod = romOverlays.values.any {
+            it.fodRelevanceScore >= 30 ||
+                it.fodConfigEntries.isNotEmpty() ||
+                it.lookupWinners.isNotEmpty() ||
+                it.decodedArscEntries.any { e -> fodArscSignalRegex.containsMatchIn(e) }
+        }
+
         for (pkg in allNames) {
             val rDeep = romOverlays[pkg]
             val gDeep = gsiOverlays[pkg]
             val rEnabled = romLines[pkg] ?: rDeep?.isEnabled
             val gEnabled = gsiLines[pkg] ?: gDeep?.isEnabled
-            val isBiometricOrDisplayOverlay = pkg.contains("fod", true) || pkg.contains("udfps", true) ||
+            val hasDeepFodSignal = rDeep != null && (
+                rDeep.fodRelevanceScore >= 30 ||
+                    rDeep.fodConfigEntries.isNotEmpty() ||
+                    rDeep.lookupWinners.isNotEmpty() ||
+                    rDeep.decodedArscEntries.any { fodArscSignalRegex.containsMatchIn(it) }
+                )
+            val isBiometricOrDisplayOverlay = hasDeepFodSignal ||
+                pkg.contains("fod", true) || pkg.contains("udfps", true) ||
                 pkg.contains("fingerprint", true) || pkg.contains("biometric", true) ||
                 pkg.contains("treble", true) || pkg.contains("systemui", true) ||
                 pkg.contains("display", true) || pkg.contains("overlay", true)
@@ -250,31 +272,47 @@ object PortAnalysisEngine {
 
             val romLocNote = rDeep?.let { ov ->
                 buildString {
-                    append("APK=${ov.apkPath} (Dir=${ov.directory})")
+                    append("Score=${ov.fodRelevanceScore} | liveMapped=${ov.provenInLiveMaps} | APK=${ov.apkPath} (Dir=${ov.directory})")
                     if (ov.targetPackage.isNotBlank()) append(" -> target=${ov.targetPackage}")
-                    if (ov.fodConfigEntries.isNotEmpty()) append(" | Keys: ${ov.fodConfigEntries.take(6).joinToString("; ")}")
+                    if (ov.lookupWinners.isNotEmpty()) append(" | Lookup: ${ov.lookupWinners.take(3).joinToString("; ")}")
+                    val keys = (ov.decodedArscEntries + ov.fodConfigEntries).distinct()
+                    if (keys.isNotEmpty()) append(" | Keys: ${keys.take(6).joinToString("; ")}")
                 }
             }.orEmpty()
 
             when {
                 rEnabled == true && (gEnabled == null || gEnabled == false) -> {
-                    val isGenericUi = pkg.contains("ambientcue", true) || pkg.contains("navbar", true)
-                    val targetList = if (isGenericUi) noise else diffs
+                    val isKnownExplicitGenericUi = pkg.contains("ambientcue", true) || pkg.contains("navbar", true)
+                    val inspectedWithoutFodContent = rDeep != null &&
+                        !hasDeepFodSignal &&
+                        rDeep.apkPath != "UNKNOWN" &&
+                        romDeepScannedFod &&
+                        !pkg.contains("fod", true) &&
+                        !pkg.contains("udfps", true) &&
+                        !pkg.contains("fingerprint", true)
+                    val isGenericNoise = isKnownExplicitGenericUi || inspectedWithoutFodContent
+                    val targetList = if (isGenericNoise) noise else diffs
                     targetList += PortFileDiffItem(
                         id = "rro_miss_${pkg.hashCode()}",
                         sourceFile = if (rDeep != null && rDeep.apkPath != "UNKNOWN") rDeep.apkPath else "raw/dumpsys_overlay.txt",
-                        category = "RRO OVERLAYS",
+                        category = if (inspectedWithoutFodContent) "GENERIC_UI_RRO_NOISE" else "RRO OVERLAYS",
                         title = pkg,
                         romEvidence = "[x] ENABLED" + if (romLocNote.isNotBlank()) "\n$romLocNote" else "",
                         gsiEvidence = if (gEnabled == null) "ABSENT" else "[ ] INACTIVE (${gDeep?.apkPath ?: "unknown path"})",
-                        impact = if (language == AppLanguage.FR) {
+                        impact = if (inspectedWithoutFodContent) {
+                            if (language == AppLanguage.FR) {
+                                "Overlay UI générique inspecté (${rDeep.apkPath}) contenant 0 clé FOD/UDFPS/HBM/Biometric décodée → écarté comme non pertinent."
+                            } else {
+                                "Generic UI overlay inspected (${rDeep.apkPath}) containing 0 decoded FOD/UDFPS/HBM/Biometric keys → filtered as non-FOD noise."
+                            }
+                        } else if (language == AppLanguage.FR) {
                             "Overlay RRO actif sur Custom ROM mais absent/inactif sur GSI" +
                                 (rDeep?.apkPath?.takeIf { it != "UNKNOWN" }?.let { " — fichier ROM à inspecter/extraire : $it" } ?: ".")
                         } else {
                             "RRO overlay enabled on Custom ROM yet missing/inactive on GSI" +
                                 (rDeep?.apkPath?.takeIf { it != "UNKNOWN" }?.let { " — ROM APK file: $it" } ?: ".")
                         },
-                        status = if (pkg.contains("fod", true) || pkg.contains("udfps", true) || pkg.contains("fingerprint", true) || pkg.contains("systemui", true)) EvidenceStatus.FAILED else EvidenceStatus.SUSPECT,
+                        status = if (hasDeepFodSignal || pkg.contains("fod", true) || pkg.contains("udfps", true) || pkg.contains("fingerprint", true) || (!isGenericNoise && pkg.contains("systemui", true))) EvidenceStatus.FAILED else EvidenceStatus.SUSPECT,
                         knowledgeLevel = KnowledgeLevel.FACT
                     )
                 }
@@ -644,6 +682,72 @@ object PortAnalysisEngine {
         }
     }
 
+    private fun diffLiveProcMapsAndDexSources(
+        romZip: RawZipArchiveBundle,
+        gsiZip: RawZipArchiveBundle,
+        diffs: MutableList<PortFileDiffItem>,
+        language: AppLanguage
+    ) {
+        val rProc = readRaw(romZip, "raw/proc_live_maps.txt")
+        val gProc = readRaw(gsiZip, "raw/proc_live_maps.txt")
+        if (rProc.isNotBlank() && !rProc.startsWith("PROC_MAPS_UNAVAILABLE")) {
+            val mapRegex = Regex("^(FOD_MATCH|MAPPED_APK|MAPPED_JAR|ENROLL_NEW_MAP|ENROLL_NEW_FD):\\s*(.+)$")
+            val rItems = rProc.lineSequence().mapNotNull { mapRegex.matchEntire(it.trim())?.groupValues?.get(2)?.trim() }.distinct().toList()
+            val gItems = gProc.lineSequence().mapNotNull { mapRegex.matchEntire(it.trim())?.groupValues?.get(2)?.trim() }.distinct().toHashSet()
+            val uniqueRomMaps = rItems.filter { item ->
+                item !in gItems && (item.contains("overlay", true) || item.contains("fod", true) || item.contains("udfps", true) ||
+                    item.contains("fingerprint", true) || item.contains("biometric", true) || item.contains("hbm", true) ||
+                    item.contains("disp_param", true) || item.contains("/sys/", true))
+            }.take(16)
+            if (uniqueRomMaps.isNotEmpty()) {
+                diffs += PortFileDiffItem(
+                    id = "proc_maps_unique_rom",
+                    sourceFile = "raw/proc_live_maps.txt",
+                    category = "LIVE /proc/<pid>/maps",
+                    title = "Fichiers/FD FOD réellement mappés dans les processus ROM mais absents sur GSI",
+                    romEvidence = uniqueRomMaps.joinToString("\n"),
+                    gsiEvidence = if (gProc.isBlank()) "(raw/proc_live_maps.txt absent)" else "${gItems.size} entrées mappées GSI (sans ces chemins)",
+                    impact = if (language == AppLanguage.FR) {
+                        "Preuve noyau directe (/proc/<pid>/maps & fd) des APK/JAR/sysfs réellement chargés en mémoire pendant l'enrôlement ROM."
+                    } else {
+                        "Direct kernel proof (/proc/<pid>/maps & fd) of APKs/JARs/sysfs actually loaded in RAM during working ROM enrollment."
+                    },
+                    status = EvidenceStatus.FAILED,
+                    knowledgeLevel = KnowledgeLevel.FACT
+                )
+            }
+        }
+
+        val rDex = readRaw(romZip, "raw/dex_source_extract.txt")
+        val gDex = readRaw(gsiZip, "raw/dex_source_extract.txt")
+        if (rDex.isNotBlank()) {
+            val dexLineRegex = Regex("^(CLASS|METHOD|STRING):\\s*(.+)$")
+            val rDexLines = rDex.lineSequence().mapNotNull { line ->
+                val t = line.trim()
+                if (dexLineRegex.matches(t)) t else null
+            }.distinct().toList()
+            val gDexLines = gDex.lineSequence().map { it.trim() }.toHashSet()
+            val uniqueRomHooks = rDexLines.filter { it !in gDexLines }.take(20)
+            if (uniqueRomHooks.isNotEmpty()) {
+                diffs += PortFileDiffItem(
+                    id = "dex_hooks_unique_rom",
+                    sourceFile = "raw/dex_source_extract.txt",
+                    category = "DEX SOURCE HOOKS",
+                    title = "Classes/Méthodes FOD extraites du code DEX Custom ROM absentes sur GSI",
+                    romEvidence = uniqueRomHooks.joinToString("\n"),
+                    gsiEvidence = if (gDex.isBlank()) "(raw/dex_source_extract.txt absent)" else "Hooks manquants dans SystemUI/Framework GSI",
+                    impact = if (language == AppLanguage.FR) {
+                        "Code source DEX réel (SystemUI / services.jar / APEX biométrique) implémentant le pont UDFPS/HBM/extCmd sur la Custom ROM."
+                    } else {
+                        "Actual DEX source hooks (SystemUI / services.jar / biometric APEX) implementing the UDFPS/HBM/extCmd bridge in Custom ROM."
+                    },
+                    status = EvidenceStatus.FAILED,
+                    knowledgeLevel = KnowledgeLevel.FACT
+                )
+            }
+        }
+    }
+
     private fun diffProvenanceArtifacts(
         romProv: List<FileProvenanceArtifact>,
         gsiProv: List<FileProvenanceArtifact>,
@@ -720,8 +824,9 @@ object PortAnalysisEngine {
     ): List<ExtractableFileItem> {
         val items = mutableListOf<ExtractableFileItem>()
 
-        // 1. Missing/Inactive active RRO Overlay APKs (highest actionable value!)
+        // 1. Missing/Inactive active RRO Overlay APKs (ranked strictly by content fodRelevanceScore & lookupWinners!)
         val rroDiffs = diffs.filter { it.category == "RRO OVERLAYS" && it.romEvidence.contains("ENABLED", true) }
+            .sortedByDescending { romOverlays[it.title]?.fodRelevanceScore ?: 0 }
         rroDiffs.forEach { d ->
             val pkg = d.title
             val deep = romOverlays[pkg]
@@ -734,9 +839,15 @@ object PortAnalysisEngine {
             }
             val contents = buildList {
                 if (deep != null) {
-                    if (deep.targetPackage.isNotBlank()) add("targetPackage=${deep.targetPackage} | static=${deep.isStatic} | priority=${deep.priority}")
+                    add("SCORE=${deep.fodRelevanceScore} | liveMapped=${deep.provenInLiveMaps} | targetPackage=${deep.targetPackage} | static=${deep.isStatic} | priority=${deep.priority}")
+                    deep.lookupWinners.forEach { add("LOOKUP WINNER: $it") }
+                    deep.decodedArscEntries.take(25).forEach { add(it) }
                     addAll(deep.manifestSummary.take(6))
                     addAll(deep.fodConfigEntries.take(20))
+                    if (deep.pseudoXmlSource.isNotBlank()) {
+                        add("--- Decoded Pseudo-XML ---")
+                        addAll(deep.pseudoXmlSource.lineSequence().take(18).toList())
+                    }
                 } else {
                     add(
                         if (language == AppLanguage.FR) {
@@ -747,9 +858,9 @@ object PortAnalysisEngine {
                     )
                 }
             }
-            val isCoreFodOrSysUi = pkg.contains("fod", true) || pkg.contains("udfps", true) ||
-                pkg.contains("fingerprint", true) || pkg.contains("systemui", true) ||
-                contents.any { it.contains("udfps", true) || it.contains("fod", true) || it.contains("hbm", true) }
+            val score = deep?.fodRelevanceScore ?: 0
+            val isProvenFod = score >= 40 || (deep?.lookupWinners?.isNotEmpty() == true) ||
+                pkg.contains("fod", true) || pkg.contains("udfps", true) || pkg.contains("fingerprint", true)
 
             items += ExtractableFileItem(
                 id = "ext_rro_${pkg.hashCode()}",
@@ -760,12 +871,17 @@ object PortAnalysisEngine {
                 targetGsiPath = targetPath,
                 importantElements = contents.distinct(),
                 missingMechanism = if (language == AppLanguage.FR) {
-                    "Fournit la surcharge RRO active vers ${deep?.targetPackage?.ifBlank { "SystemUI/Framework" } ?: "SystemUI/Framework"} (coordonnées capteur UDFPS, nœud sysfs/HBM, booléens config_udfps*)."
+                    "Score FOD=${score}${if (deep?.provenInLiveMaps == true) " [Prouvé live /proc]" else ""} — Fournit la surcharge RRO active vers ${deep?.targetPackage?.ifBlank { "SystemUI/Framework" } ?: "SystemUI/Framework"} (coordonnées capteur UDFPS, nœud sysfs/HBM, booléens config_udfps*)."
                 } else {
-                    "Provides active RRO overrides for ${deep?.targetPackage?.ifBlank { "SystemUI/Framework" } ?: "SystemUI/Framework"} (UDFPS sensor props, HBM sysfs node, config_udfps* booleans)."
+                    "FOD Score=${score}${if (deep?.provenInLiveMaps == true) " [Proven live /proc]" else ""} — Provides active RRO overrides for ${deep?.targetPackage?.ifBlank { "SystemUI/Framework" } ?: "SystemUI/Framework"} (UDFPS sensor props, HBM sysfs node, config_udfps* booleans)."
                 },
                 gsiCurrentState = d.gsiEvidence,
-                priorityPercent = if (isCoreFodOrSysUi) 96 else 82,
+                priorityPercent = when {
+                    score >= 80 -> 99
+                    score >= 40 -> 96
+                    isProvenFod -> 93
+                    else -> 78
+                },
                 canExtractWithoutVendorOrBoot = true
             )
         }
@@ -893,14 +1009,22 @@ object PortAnalysisEngine {
                 )
             }
 
-        // 5. SystemUI / Framework JAR/APK provenance when live callbacks / HBM transition stall
+        // 5. SystemUI / Framework JAR/APK provenance when live callbacks / HBM transition stall OR DEX source hooks differ
         val hasStallOrCallbackLoss = diffs.any {
             it.category == "LIVE LOGCAT CALLBACKS" ||
+                it.category == "DEX SOURCE HOOKS" ||
                 (it.category == "LIVE EXECUTION & SYSFS" && (it.title.contains("HAL", true) || it.title.contains("Sysfs", true)))
         }
         val sysUiProv = romProvenance.filter { it.category == "SYSTEMUI_FRAMEWORK" }
-        if (hasStallOrCallbackLoss && sysUiProv.isNotEmpty()) {
-            sysUiProv.take(3).forEach { sp ->
+        val romDexExtracts = loadDexSourceExtracts(romZip)
+        if ((hasStallOrCallbackLoss || romDexExtracts.isNotEmpty()) && (sysUiProv.isNotEmpty() || romDexExtracts.isNotEmpty())) {
+            sysUiProv.take(4).forEach { sp ->
+                val matchingDex = romDexExtracts.firstOrNull { it.archivePath == sp.filePath }
+                val dexElements = matchingDex?.let { dex ->
+                    (dex.matchedClasses.take(8).map { "CLASS: $it" } +
+                        dex.matchedMethods.take(12).map { "METHOD: $it" } +
+                        dex.matchedStrings.take(6).map { "STRING: $it" })
+                }.orEmpty()
                 items += ExtractableFileItem(
                     id = "ext_sysfw_${sp.id.hashCode()}",
                     category = "SYSTEMUI_FRAMEWORK",
@@ -908,17 +1032,69 @@ object PortAnalysisEngine {
                     romFilePath = sp.filePath,
                     romDirectory = sp.directory,
                     targetGsiPath = "${sp.filePath} (adapter UdfpsController / UdfpsDisplayMode / pont extCmd côté GSI)",
-                    importantElements = sp.importantContents.take(18),
+                    importantElements = (dexElements + sp.importantContents).distinct().take(24),
                     missingMechanism = if (language == AppLanguage.FR) {
-                        "Contient le pont exact UdfpsHandler / HBM / extension vendor (extCmd/onFingerDown) manquant dans le binaire GSI."
+                        "Contient le code source DEX UdfpsHandler / HBM / extension vendor (extCmd/onFingerDown) manquant dans le binaire GSI."
                     } else {
-                        "Contains exact UdfpsHandler / HBM / vendor extension bridge (extCmd/onFingerDown) missing in GSI binary."
+                        "Contains exact DEX UdfpsHandler / HBM / vendor extension bridge (extCmd/onFingerDown) missing in GSI binary."
                     },
                     gsiCurrentState = "Appels callbacks/HBM absents pendant l'enrôlement GSI",
-                    priorityPercent = 92,
+                    priorityPercent = 94,
                     canExtractWithoutVendorOrBoot = true
                 )
             }
+            // Add any DEX extract whose archive path wasn't already covered by sysUiProv
+            val coveredPaths = sysUiProv.map { it.filePath }.toHashSet()
+            romDexExtracts.filter { it.archivePath !in coveredPaths }.take(4).forEach { dex ->
+                items += ExtractableFileItem(
+                    id = "ext_dex_${dex.archivePath.hashCode()}",
+                    category = "SYSTEMUI_FRAMEWORK",
+                    title = "${dex.archivePath.substringAfterLast('/')} (DEX Source)",
+                    romFilePath = dex.archivePath,
+                    romDirectory = dex.archivePath.substringBeforeLast('/'),
+                    targetGsiPath = "${dex.archivePath} (porter classes/méthodes FOD côté GSI)",
+                    importantElements = (dex.matchedClasses.take(8).map { "CLASS: $it" } +
+                        dex.matchedMethods.take(12).map { "METHOD: $it" } +
+                        dex.matchedStrings.take(6).map { "STRING: $it" }),
+                    missingMechanism = if (language == AppLanguage.FR) {
+                        "Extrait DEX (${dex.targetHint}) contenant les hooks Java/Kotlin FOD actifs sur Custom ROM."
+                    } else {
+                        "DEX source extract (${dex.targetHint}) holding working Custom ROM FOD hooks."
+                    },
+                    gsiCurrentState = "Code source FOD divergent / absent dans GSI",
+                    priorityPercent = 93,
+                    canExtractWithoutVendorOrBoot = true
+                )
+            }
+        }
+
+        // 6. Live /proc/<pid>/maps uniquely mapped ROM APK/JAR files (excluding vendor/boot)
+        val procDiffs = diffs.filter { it.category == "LIVE /proc/<pid>/maps" }
+        if (procDiffs.isNotEmpty()) {
+            procDiffs.flatMap { it.romEvidence.lines() }
+                .map { it.trim() }
+                .filter { (it.startsWith("/product/") || it.startsWith("/system_ext/") || it.startsWith("/system/") || it.startsWith("/apex/")) && (it.endsWith(".apk", true) || it.endsWith(".jar", true)) }
+                .distinct()
+                .take(4)
+                .forEach { mappedPath ->
+                    items += ExtractableFileItem(
+                        id = "ext_proc_${mappedPath.hashCode()}",
+                        category = "LIVE_PROC_MAPPED_MODULE",
+                        title = mappedPath.substringAfterLast('/'),
+                        romFilePath = mappedPath,
+                        romDirectory = mappedPath.substringBeforeLast('/'),
+                        targetGsiPath = mappedPath,
+                        importantElements = listOf("Mappé en mémoire pendant l'enrôlement FOD (/proc/<pid>/maps)", "Chemin exact: $mappedPath"),
+                        missingMechanism = if (language == AppLanguage.FR) {
+                            "Module réellement chargé par SystemUI / system_server pendant l'enrôlement ROM mais absent de la mémoire GSI."
+                        } else {
+                            "Module actively loaded in memory by SystemUI / system_server during ROM enrollment yet absent on GSI."
+                        },
+                        gsiCurrentState = "Non mappé dans les processus GSI",
+                        priorityPercent = 91,
+                        canExtractWithoutVendorOrBoot = true
+                    )
+                }
         }
 
         return items
@@ -1187,12 +1363,18 @@ object PortAnalysisEngine {
         var target = ""
         var apkPath = "UNKNOWN"
         var dir = "UNKNOWN"
+        var parsedScore: Int? = null
+        var liveMapped = false
         val manifest = mutableListOf<String>()
         val configs = mutableListOf<String>()
+        val lookupWinners = mutableListOf<String>()
+        val decodedArsc = mutableListOf<String>()
+        val xmlLines = mutableListOf<String>()
+        var inPseudoXml = false
 
         fun flush() {
             if (pkg.isBlank()) return
-            list += OverlayDeepInspection(
+            val prelim = OverlayDeepInspection(
                 packageName = pkg,
                 targetPackage = target,
                 apkPath = apkPath,
@@ -1201,27 +1383,51 @@ object PortAnalysisEngine {
                 isStatic = isStatic,
                 priority = priority,
                 manifestSummary = manifest.toList(),
-                fodConfigEntries = configs.toList()
+                fodConfigEntries = configs.toList(),
+                provenInLiveMaps = liveMapped,
+                lookupWinners = lookupWinners.toList(),
+                pseudoXmlSource = xmlLines.joinToString("\n"),
+                decodedArscEntries = decodedArsc.toList()
             )
+            val finalScore = parsedScore ?: DynamicProvenanceInspector.computeFodOverlayScore(prelim)
+            list += prelim.copy(fodRelevanceScore = finalScore)
         }
 
         for (line in raw.lineSequence()) {
             val t = line.trim()
+            if (t == "PSEUDO_XML_START") {
+                inPseudoXml = true
+                continue
+            } else if (t == "PSEUDO_XML_END") {
+                inPseudoXml = false
+                continue
+            }
+            if (inPseudoXml && t.startsWith("XML:")) {
+                xmlLines += line.substringAfter("XML:")
+                continue
+            }
             if (t.startsWith("OVERLAY:")) {
                 flush()
                 pkg = t.removePrefix("OVERLAY:").trim()
                 enabled = false; isStatic = false; priority = 0; target = ""
                 apkPath = "UNKNOWN"; dir = "UNKNOWN"
-                manifest.clear(); configs.clear()
+                parsedScore = null; liveMapped = false; inPseudoXml = false
+                manifest.clear(); configs.clear(); lookupWinners.clear(); decodedArsc.clear(); xmlLines.clear()
             } else if (t.startsWith("ENABLED=")) {
                 enabled = t.contains("ENABLED=true", true)
                 isStatic = t.contains("STATIC=true", true)
                 priority = Regex("PRIORITY=(\\d+)").find(t)?.groupValues?.get(1)?.toIntOrNull() ?: 0
                 target = Regex("TARGET=([^|\\s]*)").find(t)?.groupValues?.get(1).orEmpty()
+                parsedScore = Regex("SCORE=(\\d+)").find(t)?.groupValues?.get(1)?.toIntOrNull()
+                liveMapped = t.contains("LIVE_MAPPED=true", true)
             } else if (t.startsWith("APK_PATH=")) {
                 apkPath = t.removePrefix("APK_PATH=").trim()
             } else if (t.startsWith("DIRECTORY=")) {
                 dir = t.removePrefix("DIRECTORY=").trim()
+            } else if (t.startsWith("LOOKUP_WINNER:")) {
+                lookupWinners += t.removePrefix("LOOKUP_WINNER:").trim()
+            } else if (t.startsWith("ARSC_ENTRY:")) {
+                decodedArsc += t.removePrefix("ARSC_ENTRY:").trim()
             } else if (t.startsWith("MANIFEST:")) {
                 manifest += t.removePrefix("MANIFEST:").trim()
             } else if (t.startsWith("CONTENT:")) {
@@ -1230,6 +1436,54 @@ object PortAnalysisEngine {
         }
         flush()
         return list
+    }
+
+    private fun loadDexSourceExtracts(zip: RawZipArchiveBundle): List<DexSourceExtract> {
+        val fromReport = zip.report?.dexSourceExtracts.orEmpty()
+        if (fromReport.isNotEmpty()) return fromReport
+        val raw = readRaw(zip, "raw/dex_source_extract.txt")
+        if (raw.isBlank()) return emptyList()
+        val out = mutableListOf<DexSourceExtract>()
+        var archivePath = ""
+        var targetHint = ""
+        val classes = mutableListOf<String>()
+        val methods = mutableListOf<String>()
+        val strings = mutableListOf<String>()
+        val outline = mutableListOf<String>()
+        var inOutline = false
+
+        fun flush() {
+            if (archivePath.isBlank()) return
+            out += DexSourceExtract(
+                archivePath = archivePath,
+                targetHint = targetHint,
+                matchedClasses = classes.toList(),
+                matchedMethods = methods.toList(),
+                matchedStrings = strings.toList(),
+                sourcePseudoSummary = outline.joinToString("\n")
+            )
+        }
+
+        for (line in raw.lineSequence()) {
+            val t = line.trim()
+            when {
+                t == "SOURCE_OUTLINE_START" -> inOutline = true
+                t == "SOURCE_OUTLINE_END" -> inOutline = false
+                inOutline && t.startsWith("CODE:") -> outline += t.removePrefix("CODE:").trimStart()
+                t.startsWith("DEX_ARCHIVE:") -> {
+                    flush()
+                    val body = t.removePrefix("DEX_ARCHIVE:").trim()
+                    archivePath = body.substringBefore(" (").trim()
+                    targetHint = body.substringAfter("(", "").removeSuffix(")").trim()
+                    classes.clear(); methods.clear(); strings.clear(); outline.clear(); inOutline = false
+                }
+                t.startsWith("CLASS:") -> classes += t.removePrefix("CLASS:").trim()
+                t.startsWith("METHOD:") -> methods += t.removePrefix("METHOD:").trim()
+                t.startsWith("STRING:") -> strings += t.removePrefix("STRING:").trim()
+            }
+        }
+        flush()
+        return out
     }
 
     private fun loadFileProvenance(zip: RawZipArchiveBundle): List<FileProvenanceArtifact> {

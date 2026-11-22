@@ -640,8 +640,8 @@ class GeminiFodAiAnalyzer(private val context: Context) {
             TASK: Produce a 100% FACTUAL root-cause explanation, EXACT FILE EXTRACTION LIST (exact partition paths, directories & key internal contents), and exact SYSTEM-SIDE PORTING BLUEPRINT explaining why GSI FOD breaks (e.g., light turns on, zero enroll/error) while Custom ROM works cleanly.
 
             STRICT GROUNDING RULES (100% FACTUAL):
-            1. Cite ONLY exact filenames inside the two ZIPs AND exact Android partition paths/directories from raw/overlay_deep_inspect.txt and raw/file_provenance_index.txt (e.g. /product/overlay/..., /system_ext/priv-app/..., /product/etc/displayconfig/..., /vendor/etc/init/...), exact keys, and exact log lines observed below.
-            2. Explain specifically WHICH concrete file(s) on the Custom ROM contain each missing overlay, property, XML feature, init trigger, or SystemUI/Framework hook, and WHAT important lines/configs are inside them.
+            1. Cite ONLY exact filenames inside the two ZIPs AND exact Android partition paths/directories from raw/overlay_deep_inspect.txt, raw/file_provenance_index.txt, raw/proc_live_maps.txt, and raw/dex_source_extract.txt (e.g. /product/overlay/..., /system_ext/priv-app/..., /product/etc/displayconfig/..., /vendor/etc/init/...), exact ARSC keys/values, decoded DEX classes/methods, and exact log lines observed below.
+            2. Reject unrelated generic UI overlays that have zero decoded FOD/UDFPS/Biometric keys in resources.arsc / lookupWinners (never fixate on package name alone). Highlight only overlays and DEX/ELF binaries backed by decoded content or live /proc/<pid>/maps.
             3. ARCHITECTURAL INVARIANT: BOTH ROM and GSI share the EXACT SAME UNTOUCHED `boot` and `vendor` partitions. NEVER propose editing /vendor, vendor HAL binaries, or boot/kernel. Only recommend GSI/system-side solutions (props/PHH -> RRO overlays / system init / system sepolicy -> SystemUI UdfpsController / HBM -> Framework BiometricService / HAL extension).
             4. Filter out noise: Ignore DisplayBrightness floats, StablePhysical display addresses, Cutouts, build dates, and anything missing/failing identically on BOTH ROM and GSI (or INACTIVE `[ ]` on ROM). Explicitly reject false leads.
             5. Conclude with a ranked recommendation ("MEILLEURE SOLUTION DE PORTAGE") with step-by-step concrete extraction/porting commands on the GSI.
@@ -781,6 +781,28 @@ class GeminiFodAiAnalyzer(private val context: Context) {
                     appendLine("  - [${b.phase}] ${b.component}: ${b.summary}")
                 }
             }
+            if (report.procLiveMaps.isNotEmpty()) {
+                appendLine()
+                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Processus FOD live (/proc/<pid>/maps & fd)" else "Live FOD Processes (/proc/<pid>/maps & fd)"}")
+                report.procLiveMaps.take(8).forEach { rec ->
+                    appendLine("  - `${rec.processName}` (pid=${rec.pid}): matchedFod=${rec.matchedFodPaths.take(4)} | newMaps=${rec.enrollmentNewMappedFiles.size} | newFds=${rec.enrollmentNewFds.size}")
+                }
+            }
+            if (report.dexSourceExtracts.isNotEmpty()) {
+                appendLine()
+                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Code source DEX extrait (Classes & Méthodes)" else "Extracted DEX Source (Classes & Methods)"}")
+                report.dexSourceExtracts.take(6).forEach { dex ->
+                    appendLine("  - `${dex.archivePath}` (${dex.targetHint}): ${dex.matchedClasses.size} classes, ${dex.matchedMethods.size} methods → ${dex.matchedClasses.take(4).joinToString(", ")}")
+                }
+            }
+            val topRros = report.overlayInspections.filter { it.fodRelevanceScore >= 30 || it.lookupWinners.isNotEmpty() }
+            if (topRros.isNotEmpty()) {
+                appendLine()
+                appendLine("### [FACT] ${if (language == AppLanguage.FR) "Overlays RRO FOD prouvés par contenu ARSC/Lookup" else "Content-Proven FOD RRO Overlays"}")
+                topRros.take(8).forEach { ov ->
+                    appendLine("  - `${ov.packageName}` (score=${ov.fodRelevanceScore}, live=${ov.provenInLiveMaps}, apk=`${ov.apkPath}`): ${(ov.lookupWinners + ov.decodedArscEntries).take(4).joinToString(" ; ")}")
+                }
+            }
             if (report.patches.isNotEmpty()) {
                 appendLine()
                 appendLine("### [CORRELATION] ${if (language == AppLanguage.FR) "Patchs / Overlays / Props détectés" else "Detected Patches / Overlays / Props"} (${report.patches.size})")
@@ -908,10 +930,16 @@ class GeminiFodAiAnalyzer(private val context: Context) {
             $elfDump
 
             DEEP OVERLAY INSPECTIONS (${report.overlayInspections.size}):
-            ${report.rawArtifacts.overlayDeepInspect.take(5000)}
+            ${report.rawArtifacts.overlayDeepInspect.take(5500)}
+
+            LIVE /proc/<pid>/maps & fd (${report.procLiveMaps.size} processes):
+            ${report.rawArtifacts.procLiveMaps.take(4500)}
+
+            DEX SOURCE-LEVEL EXTRACTS (${report.dexSourceExtracts.size} archives):
+            ${report.rawArtifacts.dexSourceExtract.take(4500)}
 
             DYNAMIC FILE PROVENANCE INDEX (${report.fileProvenance.size}):
-            ${report.rawArtifacts.fileProvenanceIndex.take(5000)}
+            ${report.rawArtifacts.fileProvenanceIndex.take(4500)}
 
             SELINUX / AVC SNIPPETS:
             ${report.rawArtifacts.selinuxDenials.take(2500)}

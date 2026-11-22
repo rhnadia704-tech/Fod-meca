@@ -108,6 +108,8 @@ object StreamingReportExporter {
                 writeRawEntry(zip, "raw/surfaceflinger_live_delta.txt", report.rawArtifacts.surfaceFlingerLiveDelta)
                 writeRawEntry(zip, "raw/overlay_deep_inspect.txt", report.rawArtifacts.overlayDeepInspect)
                 writeRawEntry(zip, "raw/file_provenance_index.txt", report.rawArtifacts.fileProvenanceIndex)
+                writeRawEntry(zip, "raw/proc_live_maps.txt", report.rawArtifacts.procLiveMaps)
+                writeRawEntry(zip, "raw/dex_source_extract.txt", report.rawArtifacts.dexSourceExtract)
             }
         }
         label
@@ -329,6 +331,46 @@ object StreamingReportExporter {
         w.appendLine("```")
         w.appendLine()
 
+        if (r.procLiveMaps.isNotEmpty()) {
+            w.appendLine("## 5b. LIVE ROOT PROCESSES (/proc/<pid>/maps & fd) (${r.procLiveMaps.size})")
+            r.procLiveMaps.forEach { rec ->
+                w.appendLine("- **${rec.processName}** (`pid=${rec.pid}`): matchedFod=${rec.matchedFodPaths.size}, newMaps=${rec.enrollmentNewMappedFiles.size}, newFds=${rec.enrollmentNewFds.size}")
+                rec.matchedFodPaths.take(15).forEach { p -> w.appendLine("  - FOD_MATCH: `$p`") }
+                rec.enrollmentNewMappedFiles.take(10).forEach { p -> w.appendLine("  - ENROLL_NEW_MAP: `$p`") }
+                rec.enrollmentNewFds.take(10).forEach { p -> w.appendLine("  - ENROLL_NEW_FD: `$p`") }
+            }
+            w.appendLine()
+        }
+
+        if (r.dexSourceExtracts.isNotEmpty()) {
+            w.appendLine("## 5c. DEX SOURCE-LEVEL EXTRACTS (${r.dexSourceExtracts.size})")
+            r.dexSourceExtracts.forEach { dex ->
+                w.appendLine("### `${dex.archivePath}` (${dex.targetHint})")
+                w.appendLine("```kotlin")
+                w.appendLine(dex.sourcePseudoSummary)
+                w.appendLine("```")
+            }
+            w.appendLine()
+        }
+
+        val scoredOverlays = r.overlayInspections.filter { it.fodRelevanceScore > 0 || it.decodedArscEntries.isNotEmpty() || it.pseudoXmlSource.isNotBlank() }
+        if (scoredOverlays.isNotEmpty()) {
+            w.appendLine("## 5d. CONTENT-SCORED OVERLAY DECODED ARSC & PSEUDO-XML (${scoredOverlays.size})")
+            scoredOverlays.take(20).forEach { ov ->
+                w.appendLine("### `${ov.packageName}` (score=${ov.fodRelevanceScore}, live=${ov.provenInLiveMaps}, apk=`${ov.apkPath}`)")
+                if (ov.lookupWinners.isNotEmpty()) {
+                    ov.lookupWinners.forEach { w.appendLine("- LOOKUP_WINNER: `$it`") }
+                }
+                ov.decodedArscEntries.take(25).forEach { w.appendLine("- `$it`") }
+                if (ov.pseudoXmlSource.isNotBlank()) {
+                    w.appendLine("```xml")
+                    w.appendLine(ov.pseudoXmlSource)
+                    w.appendLine("```")
+                }
+            }
+            w.appendLine()
+        }
+
         w.appendLine("## 6. FULL UNTRUNCATED RAW ARTIFACTS")
         val rawBlocks = listOf(
             "logcat_enrollment" to r.rawArtifacts.logcatEnrollment,
@@ -348,6 +390,8 @@ object StreamingReportExporter {
             "init_rc_snippets" to r.rawArtifacts.initRcSnippets,
             "overlay_deep_inspect" to r.rawArtifacts.overlayDeepInspect,
             "file_provenance_index" to r.rawArtifacts.fileProvenanceIndex,
+            "proc_live_maps" to r.rawArtifacts.procLiveMaps,
+            "dex_source_extract" to r.rawArtifacts.dexSourceExtract,
             "getprop_all" to r.rawArtifacts.getpropAll
         )
         rawBlocks.forEach { (title, body) ->
@@ -428,6 +472,8 @@ object StreamingReportExporter {
         writeHtmlDetails(w, "RAW: surfaceflinger_live_delta", r.rawArtifacts.surfaceFlingerLiveDelta)
         writeHtmlDetails(w, "RAW: overlay_deep_inspect", r.rawArtifacts.overlayDeepInspect)
         writeHtmlDetails(w, "RAW: file_provenance_index", r.rawArtifacts.fileProvenanceIndex)
+        writeHtmlDetails(w, "RAW: proc_live_maps", r.rawArtifacts.procLiveMaps)
+        writeHtmlDetails(w, "RAW: dex_source_extract", r.rawArtifacts.dexSourceExtract)
         writeHtmlDetails(w, "RAW: getprop_all", r.rawArtifacts.getpropAll)
         w.appendLine("</body></html>")
     }

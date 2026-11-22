@@ -7,8 +7,10 @@ import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Environment
 import android.view.Display
+import com.example.model.DexSourceExtract
 import com.example.model.EnvironmentSnapshot
 import com.example.model.FileProvenanceArtifact
+import com.example.model.LiveProcessMapRecord
 import com.example.model.OverlayDeepInspection
 import com.example.model.SysfsTransition
 import java.io.File
@@ -41,7 +43,11 @@ data class BaselineProbeResult(
     val overlayInspections: List<OverlayDeepInspection> = emptyList(),
     val fileProvenance: List<FileProvenanceArtifact> = emptyList(),
     val overlayDeepInspect: String = "",
-    val fileProvenanceIndex: String = ""
+    val fileProvenanceIndex: String = "",
+    val procLiveMaps: List<LiveProcessMapRecord> = emptyList(),
+    val dexSourceExtracts: List<DexSourceExtract> = emptyList(),
+    val procLiveMapsText: String = "",
+    val dexSourceExtractText: String = ""
 )
 
 data class LivePollSnapshot(
@@ -56,15 +62,12 @@ data class FinalSessionCapture(
     val liveLogcat: String,
     val dmesgDelta: String,
     val surfaceFlingerLiveDelta: String,
-    val sysfsTransitions: List<SysfsTransition>
+    val sysfsTransitions: List<SysfsTransition>,
+    val procLiveMaps: List<LiveProcessMapRecord> = emptyList(),
+    val procLiveMapsText: String = ""
 )
 
 class SystemProbeCollector(private val context: Context) {
-
-    private val fodKeywordRegex = Regex(
-        "(fingerprint|biometric|udfps|fod|hbm|lhbm|dimlayer|goodix|gf_|fp_|disp_param|touch_dev|avc:\\s*denied)",
-        RegexOption.IGNORE_CASE
-    )
 
     private val defaultSysfsCandidates = listOf(
         "/sys/class/drm/card0-DSI-1/disp_param",
@@ -187,15 +190,41 @@ class SystemProbeCollector(private val context: Context) {
             readReadableInitRcSnippets(accessLimitations)
         }
 
+        val procMapsBaseline = if (effectiveRoot) {
+            collectLiveProcessMaps(accessLimitations = accessLimitations)
+        } else {
+            emptyList()
+        }
+
+        val liveHalBinaries = procMapsBaseline
+            .filter {
+                val p = it.processName.lowercase()
+                p.contains("fingerprint") || p.contains("biometric") || p.contains("goodix") ||
+                    p.contains("fpc") || p.contains("silead") || p.contains("focal") ||
+                    p.contains("egis") || p.contains("displayfeature") || p.contains("touchfeature") ||
+                    p.contains("surfaceflinger")
+            }
+            .flatMap { it.mappedLibs }
+            .filter { lib ->
+                val l = lib.lowercase()
+                l.endsWith(".so") && (
+                    l.contains("fod") || l.contains("udfps") || l.contains("fingerprint") ||
+                        l.contains("biometric") || l.contains("goodix") || l.contains("fpc") ||
+                        l.contains("silead") || l.contains("focal") || l.contains("egis") ||
+                        l.contains("displayfeature") || l.contains("touchfeature") || l.contains("hwcomposer") ||
+                        l.startsWith("/vendor/")
+                    )
+            }
+
         val discoveredBinaries = if (effectiveRoot) {
             val binaryListing = probeCommand(
-                "ls -1 /vendor/bin/hw/*fingerprint* /vendor/bin/hw/*biometric* /vendor/bin/hw/*fod* /vendor/lib64/hw/*fingerprint* /vendor/lib64/*fod* /vendor/lib64/*goodix* /vendor/lib64/*fpc* /vendor/lib64/*silead* /vendor/lib64/*focal* /vendor/lib64/*egis* /system/lib64/*fingerprint* /system_ext/lib64/*fod* 2>/dev/null",
+                "ls -1 /vendor/bin/hw/*fingerprint* /vendor/bin/hw/*biometric* /vendor/bin/hw/*fod* /vendor/lib64/hw/*fingerprint* /vendor/lib64/*fod* /vendor/lib64/*goodix* /vendor/lib64/*fpc* /vendor/lib64/*silead* /vendor/lib64/*focal* /vendor/lib64/*egis* /system/lib64/*fingerprint* /system_ext/lib64/*fod* /system_ext/lib64/*udfps* 2>/dev/null",
                 true,
                 accessLimitations
             )
-            binaryListing.lines()
+            (binaryListing.lines()
                 .map { it.trim() }
-                .filter { it.startsWith("/") && !it.contains("No such file") && !it.contains("Permission denied") }
+                .filter { it.startsWith("/") && !it.contains("No such file") && !it.contains("Permission denied") } + liveHalBinaries)
                 .distinct()
         } else {
             scanReadableBinaries(accessLimitations)
@@ -222,8 +251,15 @@ class SystemProbeCollector(private val context: Context) {
             lshalOutput = lshalRes,
             vintfManifests = vintfRes,
             effectiveRoot = effectiveRoot,
-            accessLimitations = accessLimitations
+            accessLimitations = accessLimitations,
+            procLiveMaps = procMapsBaseline
         )
+
+        val procMapsText = if (procMapsBaseline.isNotEmpty()) {
+            DynamicProvenanceInspector.serializeProcLiveMaps(procMapsBaseline)
+        } else {
+            if (effectiveRoot) "NO_ACTIVE_FOD_PROCESS_MAPS" else "PROC_MAPS_UNAVAILABLE (root required for /proc/<pid>/maps)"
+        }
 
         val bootSig = listOfNotNull(
             propMap["ro.bootimage.build.fingerprint"],
@@ -289,7 +325,11 @@ class SystemProbeCollector(private val context: Context) {
             overlayInspections = provenanceBundle.overlayInspections,
             fileProvenance = provenanceBundle.fileProvenance,
             overlayDeepInspect = provenanceBundle.overlayDeepInspectText,
-            fileProvenanceIndex = provenanceBundle.fileProvenanceIndexText
+            fileProvenanceIndex = provenanceBundle.fileProvenanceIndexText,
+            procLiveMaps = procMapsBaseline,
+            dexSourceExtracts = provenanceBundle.dexSourceExtracts,
+            procLiveMapsText = procMapsText,
+            dexSourceExtractText = provenanceBundle.dexSourceExtractText
         )
     }
 
@@ -389,12 +429,61 @@ class SystemProbeCollector(private val context: Context) {
             )
         }
 
+        val mergedProcMaps = if (effectiveRoot) {
+            val postMaps = collectLiveProcessMaps(accessLimitations = null)
+            mergeProcMapsWithDelta(baseline.procLiveMaps, postMaps)
+        } else {
+            baseline.procLiveMaps
+        }
+        val mergedProcText = if (mergedProcMaps.isNotEmpty()) {
+            DynamicProvenanceInspector.serializeProcLiveMaps(mergedProcMaps)
+        } else {
+            baseline.procLiveMapsText
+        }
+
         return FinalSessionCapture(
             liveLogcat = liveLogcat,
             dmesgDelta = dmesgDeltaText,
             surfaceFlingerLiveDelta = sfDeltaText,
-            sysfsTransitions = transitions
+            sysfsTransitions = transitions,
+            procLiveMaps = mergedProcMaps,
+            procLiveMapsText = mergedProcText
         )
+    }
+
+    internal suspend fun collectLiveProcessMaps(
+        accessLimitations: MutableList<String>?
+    ): List<LiveProcessMapRecord> {
+        val psOut = ShellExecutor.exec(
+            "ps -A -o PID,NAME 2>/dev/null | grep -iE 'systemui|system_server|surfaceflinger|fingerprint|biometric|goodix|fpc|silead|focal|egis|udfps|displayfeature|touchfeature' | head -n 14",
+            useRoot = true,
+            timeoutMs = 5_000L
+        ).stdout
+
+        val pidToName = LinkedHashMap<Int, String>()
+        psOut.lineSequence().forEach { line ->
+            val parts = line.trim().split(Regex("\\s+"), limit = 2)
+            val pid = parts.getOrNull(0)?.toIntOrNull()
+            val name = parts.getOrNull(1)?.trim()
+            if (pid != null && pid > 0 && !name.isNullOrBlank()) {
+                pidToName[pid] = name
+            }
+        }
+        if (pidToName.isEmpty()) {
+            val pidofOut = ShellExecutor.exec("pidof com.android.systemui system_server surfaceflinger 2>/dev/null", useRoot = true, timeoutMs = 3_000L).stdout
+            pidofOut.trim().split(Regex("\\s+")).mapNotNull { it.toIntOrNull() }.take(8).forEach { pid ->
+                pidToName[pid] = "pid_$pid"
+            }
+        }
+        if (pidToName.isEmpty()) {
+            accessLimitations?.add("Live /proc/<pid>/maps returned 0 matching FOD processes.")
+            return emptyList()
+        }
+
+        val pidList = pidToName.keys.take(10).joinToString(" ")
+        val script = "for p in $pidList; do echo \"=== PID \$p ===\"; grep -oE '/[^[:space:]]+\\.(apk|jar|so|oat|vdex)' \"/proc/\$p/maps\" 2>/dev/null | sort -u | head -n 220; echo \"--- FD \$p ---\"; ls -l \"/proc/\$p/fd\" 2>/dev/null | grep -oE '/(dev|sys|vendor|product|system|system_ext|apex|data)[^[:space:]]*' | sort -u | head -n 80; done"
+        val res = ShellExecutor.exec(script, useRoot = true, timeoutMs = 8_000L)
+        return parseProcMapsOutput(res.stdout, pidToName)
     }
 
     suspend fun captureLiveEnrollmentLogs(
@@ -792,6 +881,91 @@ class SystemProbeCollector(private val context: Context) {
                 .sorted()
         } catch (_: Exception) {
             emptyList()
+        }
+    }
+
+    companion object {
+        private val fodKeywordRegex = Regex(
+            "(fingerprint|biometric|udfps|fod|hbm|lhbm|dimlayer|goodix|gf_|fp_|disp_param|touch_dev|avc:\\s*denied)",
+            RegexOption.IGNORE_CASE
+        )
+
+        internal fun parseProcMapsOutput(
+            raw: String,
+            pidToName: Map<Int, String>
+        ): List<LiveProcessMapRecord> {
+            if (raw.isBlank()) return emptyList()
+            val out = mutableListOf<LiveProcessMapRecord>()
+            var currentPid: Int? = null
+            var inFds = false
+            val mapped = linkedSetOf<String>()
+            val fds = linkedSetOf<String>()
+
+            fun flush() {
+                val pid = currentPid ?: return
+                val name = pidToName[pid] ?: "pid_$pid"
+                val apks = mapped.filter { it.endsWith(".apk", true) }
+                val jars = mapped.filter { it.endsWith(".jar", true) || it.endsWith(".oat", true) || it.endsWith(".vdex", true) }
+                val libs = mapped.filter { it.endsWith(".so", true) }
+                val fodMatches = (mapped + fds).filter {
+                    fodKeywordRegex.containsMatchIn(it) || it.contains("overlay", true) || it.contains("/sys/") || it.contains("/dev/")
+                }.distinct()
+                out += LiveProcessMapRecord(
+                    pid = pid,
+                    processName = name,
+                    mappedApks = apks.take(80),
+                    mappedJarsAndDex = jars.take(80),
+                    mappedLibs = libs.take(100),
+                    openFds = fds.toList().take(60),
+                    matchedFodPaths = fodMatches.take(60)
+                )
+            }
+
+            for (line in raw.lineSequence()) {
+                val t = line.trim()
+                when {
+                    t.startsWith("=== PID ") -> {
+                        flush()
+                        currentPid = t.removePrefix("=== PID ").removeSuffix("===").trim().toIntOrNull()
+                        inFds = false
+                        mapped.clear()
+                        fds.clear()
+                    }
+                    t.startsWith("--- FD ") -> {
+                        inFds = true
+                    }
+                    t.startsWith("/") -> {
+                        if (inFds) fds += t else mapped += t
+                    }
+                }
+            }
+            flush()
+            return out
+        }
+
+        internal fun mergeProcMapsWithDelta(
+            baseline: List<LiveProcessMapRecord>,
+            post: List<LiveProcessMapRecord>
+        ): List<LiveProcessMapRecord> {
+            if (baseline.isEmpty()) return post
+            if (post.isEmpty()) return baseline
+            val baseByPid = baseline.associateBy { it.pid }
+            return post.map { p ->
+                val b = baseByPid[p.pid]
+                if (b == null) {
+                    p
+                } else {
+                    val baseFiles = (b.mappedApks + b.mappedJarsAndDex + b.mappedLibs).toHashSet()
+                    val curFiles = p.mappedApks + p.mappedJarsAndDex + p.mappedLibs
+                    val newMaps = curFiles.filter { it !in baseFiles }
+                    val baseFds = b.openFds.toHashSet()
+                    val newFds = p.openFds.filter { it !in baseFds }
+                    p.copy(
+                        enrollmentNewMappedFiles = newMaps.take(30),
+                        enrollmentNewFds = newFds.take(30)
+                    )
+                }
+            }
         }
     }
 }

@@ -81,6 +81,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -662,11 +663,19 @@ fun DiagnosticScreen(
                                 modifier = Modifier.padding(top = 8.dp)
                             )
                         }
-                        items(report.overlayInspections, key = { "ov_insp_${it.packageName}" }) { ov ->
+                        items(report.overlayInspections, key = { "ov_insp_${it.packageName}_${it.apkPath}" }) { ov ->
                             var expandedOv by remember { mutableStateOf(false) }
+                            val isProvenFod = ov.fodRelevanceScore >= 40 || ov.lookupWinners.isNotEmpty() || ov.provenInLiveMaps
+                            val borderColor = when {
+                                isProvenFod -> LocalFodStatusColors.current.confirmed.copy(alpha = 0.85f)
+                                ov.isEnabled -> MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+                                else -> MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+                            }
                             TelemetrySectionCard(
-                                borderColor = if (ov.isEnabled) LocalFodStatusColors.current.confirmed.copy(alpha = 0.6f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
-                                modifier = Modifier.clickable { expandedOv = !expandedOv }
+                                borderColor = borderColor,
+                                modifier = Modifier
+                                    .testTag("overlay_inspect_card_${ov.packageName}")
+                                    .clickable { expandedOv = !expandedOv }
                             ) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
@@ -675,6 +684,26 @@ fun DiagnosticScreen(
                                 ) {
                                     Text(ov.packageName, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
                                     StatusPill(status = if (ov.isEnabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED)
+                                }
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    TagChip(
+                                        text = "${strings.arscScoreLabel}: ${ov.fodRelevanceScore}",
+                                        color = if (isProvenFod) LocalFodStatusColors.current.confirmed else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    if (ov.fodRelevanceScore >= 40) {
+                                        TagChip(strings.provenFodBadge, LocalFodStatusColors.current.confirmed)
+                                    }
+                                    if (ov.provenInLiveMaps) {
+                                        TagChip(strings.liveProcMapsBadge, MaterialTheme.colorScheme.primary)
+                                    }
+                                    if (ov.lookupWinners.isNotEmpty()) {
+                                        TagChip(strings.lookupWinnerBadge, MaterialTheme.colorScheme.tertiary)
+                                    }
                                 }
                                 Text(
                                     text = "Target: ${ov.targetPackage.ifBlank { "?" }} · prio=${ov.priority} · static=${ov.isStatic}",
@@ -692,7 +721,9 @@ fun DiagnosticScreen(
                                     if (ov.apkPath.startsWith("/")) {
                                         IconButton(
                                             onClick = { copyPathToClipboard(context, ov.apkPath) },
-                                            modifier = Modifier.size(48.dp)
+                                            modifier = Modifier
+                                                .size(48.dp)
+                                                .testTag("copy_overlay_${ov.packageName}")
                                         ) {
                                             Icon(Icons.Filled.ContentCopy, contentDescription = strings.portCopyPathLabel, modifier = Modifier.size(16.dp))
                                         }
@@ -704,13 +735,47 @@ fun DiagnosticScreen(
                                     )
                                 }
                                 AnimatedVisibility(visible = expandedOv) {
-                                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                        if (ov.lookupWinners.isNotEmpty()) {
+                                            Text(strings.lookupWinnerBadge, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
+                                            ov.lookupWinners.forEach { w ->
+                                                Text("• $w", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
+                                            }
+                                        }
+                                        if (ov.decodedArscEntries.isNotEmpty()) {
+                                            Text("resources.arsc (${ov.decodedArscEntries.size})", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                            Surface(
+                                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Text(
+                                                    text = ov.decodedArscEntries.take(30).joinToString("\n"),
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                                    modifier = Modifier.padding(8.dp)
+                                                )
+                                            }
+                                        }
                                         ov.manifestSummary.forEach { m ->
                                             Text("• $m", style = MaterialTheme.typography.labelSmall)
                                         }
                                         ov.fodConfigEntries.forEach { entry ->
                                             Text("• $entry", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                        }
+                                        if (ov.pseudoXmlSource.isNotBlank()) {
+                                            Text(strings.pseudoXmlAndArscTitle, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
+                                            Surface(
+                                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Text(
+                                                    text = ov.pseudoXmlSource.take(2800),
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                                    modifier = Modifier.padding(8.dp)
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -753,6 +818,169 @@ fun DiagnosticScreen(
                                         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
                                         prov.importantContents.forEach { line ->
                                             Text("• $line", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Pure-Kotlin Multi-DEX Source Extraction Section
+                    if (report.dexSourceExtracts.isNotEmpty()) {
+                        item {
+                            Text(
+                                text = "${strings.dexSourceExtractTitle} (${report.dexSourceExtracts.size})",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                        items(report.dexSourceExtracts, key = { "dex_ext_${it.archivePath}" }) { dex ->
+                            var expandedDex by remember { mutableStateOf(false) }
+                            TelemetrySectionCard(
+                                borderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.65f),
+                                modifier = Modifier
+                                    .testTag("dex_extract_card_${dex.archivePath.substringAfterLast('/')}")
+                                    .clickable { expandedDex = !expandedDex }
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = dex.archivePath.substringAfterLast('/'),
+                                        style = MaterialTheme.typography.titleSmall,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    if (dex.archivePath.startsWith("/")) {
+                                        IconButton(
+                                            onClick = { copyPathToClipboard(context, dex.archivePath) },
+                                            modifier = Modifier
+                                                .size(48.dp)
+                                                .testTag("copy_dex_${dex.archivePath.substringAfterLast('/')}")
+                                        ) {
+                                            Icon(Icons.Filled.ContentCopy, contentDescription = strings.portCopyPathLabel, modifier = Modifier.size(16.dp))
+                                        }
+                                    }
+                                    Icon(
+                                        imageVector = if (expandedDex) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                                Text(
+                                    text = "${dex.archivePath} (${dex.targetHint})",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    text = "${dex.matchedClasses.size} classes · ${dex.matchedMethods.size} methods · ${dex.matchedStrings.size} FOD strings",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                AnimatedVisibility(visible = expandedDex) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                        if (dex.sourcePseudoSummary.isNotBlank()) {
+                                            Surface(
+                                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Text(
+                                                    text = dex.sourcePseudoSummary.take(3600),
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                                    modifier = Modifier.padding(8.dp)
+                                                )
+                                            }
+                                        }
+                                        if (dex.matchedMethods.isNotEmpty()) {
+                                            Text(
+                                                text = dex.matchedMethods.take(20).joinToString("\n"),
+                                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Root Live Process /proc/<pid>/maps & fd Section
+                    if (report.procLiveMaps.isNotEmpty()) {
+                        item {
+                            Text(
+                                text = "${strings.procLiveMapsTitle} (${report.procLiveMaps.size})",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                        items(report.procLiveMaps, key = { "proc_map_${it.pid}_${it.processName}" }) { rec ->
+                            var expandedProc by remember { mutableStateOf(false) }
+                            val hasDelta = rec.enrollmentNewMappedFiles.isNotEmpty() || rec.enrollmentNewFds.isNotEmpty()
+                            TelemetrySectionCard(
+                                borderColor = if (hasDelta) LocalFodStatusColors.current.confirmed.copy(alpha = 0.75f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+                                modifier = Modifier
+                                    .testTag("proc_map_card_${rec.pid}")
+                                    .clickable { expandedProc = !expandedProc }
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "${rec.processName} (pid=${rec.pid})",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    if (hasDelta) {
+                                        TagChip(strings.liveProcMapsBadge, LocalFodStatusColors.current.confirmed)
+                                    }
+                                    Icon(
+                                        imageVector = if (expandedProc) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                                Text(
+                                    text = "${rec.mappedApks.size} APKs · ${rec.mappedJarsAndDex.size} JAR/DEX · ${rec.mappedLibs.size} .so · ${rec.openFds.size} FDs",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                if (rec.matchedFodPaths.isNotEmpty()) {
+                                    Text(
+                                        text = rec.matchedFodPaths.take(4).joinToString(" | "),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                AnimatedVisibility(visible = expandedProc) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                        if (rec.enrollmentNewMappedFiles.isNotEmpty()) {
+                                            Text("T0→T1 New Maps:", style = MaterialTheme.typography.labelSmall, color = LocalFodStatusColors.current.confirmed)
+                                            Text(
+                                                text = rec.enrollmentNewMappedFiles.joinToString("\n"),
+                                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace)
+                                            )
+                                        }
+                                        if (rec.enrollmentNewFds.isNotEmpty()) {
+                                            Text("T0→T1 New FDs:", style = MaterialTheme.typography.labelSmall, color = LocalFodStatusColors.current.confirmed)
+                                            Text(
+                                                text = rec.enrollmentNewFds.joinToString("\n"),
+                                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace)
+                                            )
+                                        }
+                                        if (rec.mappedApks.isNotEmpty()) {
+                                            Text("Mapped APKs:\n${rec.mappedApks.take(16).joinToString("\n")}", style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace))
+                                        }
+                                        if (rec.mappedJarsAndDex.isNotEmpty()) {
+                                            Text("Mapped JAR/OAT:\n${rec.mappedJarsAndDex.take(16).joinToString("\n")}", style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace))
+                                        }
+                                        if (rec.matchedFodPaths.isNotEmpty()) {
+                                            Text("All Matched FOD Paths:\n${rec.matchedFodPaths.take(25).joinToString("\n")}", style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace))
                                         }
                                     }
                                 }

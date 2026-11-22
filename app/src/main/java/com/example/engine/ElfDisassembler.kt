@@ -148,29 +148,45 @@ object ElfDisassembler {
             }
         }
 
-        val strings = extractRelevantStrings(bytes, limit = 160)
+        val strings = extractRelevantStrings(bytes, limit = 240)
+            .sortedWith(
+                compareByDescending<String> {
+                    it.startsWith("/sys/") || it.startsWith("/dev/") ||
+                        it.contains("extcmd", true) || it.contains("disp_param", true) ||
+                        it.contains("onfinger", true) || it.contains("hbm", true) || it.contains("lhbm", true)
+                }.thenByDescending { it.contains("udfps", true) || it.contains("fod", true) }
+            )
+
+        val prioritizedSymbols = matchedSymbols.sortedByDescending { sym ->
+            val l = sym.name.lowercase()
+            when {
+                l.contains("extcmd") || l.contains("onfinger") || l.contains("hbm") || l.contains("lhbm") -> 3
+                l.contains("fod") || l.contains("udfps") || l.contains("enroll") || l.contains("acquire") -> 2
+                else -> 1
+            }
+        }
 
         val disasmBuilder = StringBuilder()
         if (isAarch64 && textSec != null && textSec.offset >= 0 &&
             textSec.offset + textSec.size <= bytes.size
         ) {
-            val targets = matchedSymbols.filter {
+            val targets = prioritizedSymbols.filter {
                 it.value >= textSec.addr && it.value < textSec.addr + textSec.size
-            }.take(6)
+            }.take(10)
 
             if (targets.isNotEmpty()) {
                 for (sym in targets) {
                     val fileStart = (textSec.offset + (sym.value - textSec.addr)).toInt()
                     val instrCount = minOf(
-                        maxOf((sym.size / 4L).toInt(), 20),
-                        40
+                        maxOf((sym.size / 4L).toInt(), 24),
+                        50
                     )
-                    disasmBuilder.appendLine("// Function: ${sym.name} @ 0x${sym.value.toString(16)}")
+                    disasmBuilder.appendLine("// Function: ${sym.name} @ 0x${sym.value.toString(16)} (${sym.size}B)")
                     disasmBuilder.appendLine(decodeAarch64Window(bytes, buf, fileStart, sym.value, instrCount))
                 }
             } else {
                 // Decode entry snippet of .text if symbols were stripped
-                val count = minOf((textSec.size / 4L).toInt(), 32)
+                val count = minOf((textSec.size / 4L).toInt(), 48)
                 disasmBuilder.appendLine("// .text entry snippet (symbols stripped) @ 0x${textSec.addr.toString(16)}")
                 disasmBuilder.appendLine(
                     decodeAarch64Window(bytes, buf, textSec.offset.toInt(), textSec.addr, count)
@@ -186,9 +202,9 @@ object ElfDisassembler {
             fileSizeBytes = bytes.size.toLong(),
             isReadable = true,
             dtNeeded = dtNeeded.distinct(),
-            fodSymbols = matchedSymbols.map {
+            fodSymbols = prioritizedSymbols.map {
                 "${it.name} @0x${it.value.toString(16)} (${it.size}B)"
-            }.distinct().take(120),
+            }.distinct().take(160),
             fodStrings = strings,
             disassemblyPseudoCode = disasmBuilder.toString().trim()
         )

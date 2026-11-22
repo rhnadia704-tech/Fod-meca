@@ -134,7 +134,35 @@ data class OverlayDeepInspection(
     val priority: Int = 0,
     val manifestSummary: List<String> = emptyList(),
     val fodConfigEntries: List<String> = emptyList(),
-    val rawDumpNote: String = ""
+    val rawDumpNote: String = "",
+    val fodRelevanceScore: Int = 0,
+    val provenInLiveMaps: Boolean = false,
+    val lookupWinners: List<String> = emptyList(),
+    val pseudoXmlSource: String = "",
+    val decodedArscEntries: List<String> = emptyList()
+)
+
+@JsonClass(generateAdapter = true)
+data class LiveProcessMapRecord(
+    val pid: Int,
+    val processName: String,
+    val mappedApks: List<String> = emptyList(),
+    val mappedJarsAndDex: List<String> = emptyList(),
+    val mappedLibs: List<String> = emptyList(),
+    val openFds: List<String> = emptyList(),
+    val matchedFodPaths: List<String> = emptyList(),
+    val enrollmentNewMappedFiles: List<String> = emptyList(),
+    val enrollmentNewFds: List<String> = emptyList()
+)
+
+@JsonClass(generateAdapter = true)
+data class DexSourceExtract(
+    val archivePath: String,
+    val targetHint: String,
+    val matchedClasses: List<String> = emptyList(),
+    val matchedMethods: List<String> = emptyList(),
+    val matchedStrings: List<String> = emptyList(),
+    val sourcePseudoSummary: String = ""
 )
 
 @JsonClass(generateAdapter = true)
@@ -168,7 +196,9 @@ data class RawArtifactsBundle(
     val dmesgDelta: String = "",
     val surfaceFlingerLiveDelta: String = "",
     val overlayDeepInspect: String = "",
-    val fileProvenanceIndex: String = ""
+    val fileProvenanceIndex: String = "",
+    val procLiveMaps: String = "",
+    val dexSourceExtract: String = ""
 )
 
 @JsonClass(generateAdapter = true)
@@ -234,7 +264,9 @@ data class FodDiagnosticReport(
     val fingerDownChain: List<FingerDownStep> = emptyList(),
     val sysfsTransitions: List<SysfsTransition> = emptyList(),
     val overlayInspections: List<OverlayDeepInspection> = emptyList(),
-    val fileProvenance: List<FileProvenanceArtifact> = emptyList()
+    val fileProvenance: List<FileProvenanceArtifact> = emptyList(),
+    val procLiveMaps: List<LiveProcessMapRecord> = emptyList(),
+    val dexSourceExtracts: List<DexSourceExtract> = emptyList()
 )
 
 @JsonClass(generateAdapter = true)

@@ -13,6 +13,7 @@ import com.example.model.FingerDownStep
 import com.example.model.FodDiagnosticReport
 import com.example.model.InvestigationFinding
 import com.example.model.KnowledgeLevel
+import com.example.model.LiveProcessMapRecord
 import com.example.model.RawArtifactsBundle
 import com.example.model.SessionEvent
 import com.example.model.SysfsTransition
@@ -42,7 +43,9 @@ object PatchAndArchitectureAnalyzer {
         language: AppLanguage,
         dmesgDelta: String = "",
         surfaceFlingerLiveDelta: String = "",
-        sysfsTransitions: List<SysfsTransition> = emptyList()
+        sysfsTransitions: List<SysfsTransition> = emptyList(),
+        procLiveMaps: List<LiveProcessMapRecord> = baseline.procLiveMaps,
+        procLiveMapsText: String = baseline.procLiveMapsText
     ): FodDiagnosticReport {
         val components = mutableListOf<DiscoveredComponent>()
         val edges = mutableListOf<DependencyEdge>()
@@ -174,6 +177,7 @@ object PatchAndArchitectureAnalyzer {
             sessionFlow = baseSessionFlow,
             fingerDownChain = finalChain,
             sysfsTransitions = sysfsTransitions,
+            procLiveMaps = procLiveMaps,
             findings = findings,
             language = language
         )
@@ -347,12 +351,16 @@ object PatchAndArchitectureAnalyzer {
                 dmesgDelta = dmesgDelta,
                 surfaceFlingerLiveDelta = surfaceFlingerLiveDelta,
                 overlayDeepInspect = baseline.overlayDeepInspect,
-                fileProvenanceIndex = baseline.fileProvenanceIndex
+                fileProvenanceIndex = baseline.fileProvenanceIndex,
+                procLiveMaps = procLiveMapsText,
+                dexSourceExtract = baseline.dexSourceExtractText
             ),
             fingerDownChain = finalChain,
             sysfsTransitions = sysfsTransitions,
             overlayInspections = baseline.overlayInspections,
-            fileProvenance = baseline.fileProvenance
+            fileProvenance = baseline.fileProvenance,
+            procLiveMaps = procLiveMaps,
+            dexSourceExtracts = baseline.dexSourceExtracts
         )
     }
 
@@ -764,75 +772,102 @@ object PatchAndArchitectureAnalyzer {
             }
 
         val seenOverlayPkgs = linkedSetOf<String>()
-        baseline.dumpsysOverlay.lineSequence()
-            .filter {
-                val l = it.lowercase()
-                l.contains("fod") || l.contains("udfps") || l.contains("treble") ||
+        val overlayEntries = baseline.dumpsysOverlay.lineSequence()
+            .map { it.trim() }
+            .filter { line ->
+                val l = line.lowercase()
+                l.startsWith("[x]") || l.startsWith("[ ]") || l.contains("state_enabled") ||
+                    l.contains("fod") || l.contains("udfps") || l.contains("treble") ||
                     l.contains("fingerprint") || l.contains("biometric") || l.contains("systemui") ||
                     l.contains("overlay")
             }
-            .distinct()
-            .take(60)
-            .forEachIndexed { idx, line ->
-                val trimmed = line.trim()
+            .mapNotNull { trimmed ->
                 val enabled = trimmed.startsWith("[x]", true) || trimmed.contains("STATE_ENABLED")
-                val pkg = trimmed.removePrefix("[x]").removePrefix("[ ]").trim().substringBefore(" ")
-                if (pkg.isBlank()) return@forEachIndexed
-                seenOverlayPkgs += pkg
-                val deep = overlayByPkg[pkg]
-                val resolvedApk = deep?.apkPath?.takeIf { it != "UNKNOWN" } ?: pkg
-                val resolvedDir = deep?.directory?.takeIf { it != "UNKNOWN" } ?: "UNKNOWN"
-                val keyEntriesPreview = deep?.fodConfigEntries?.take(5)?.joinToString(" ; ").orEmpty()
-                patches += DetectedPatch(
-                    id = "patch_rro_$idx",
-                    name = pkg,
-                    source = if (deep != null && deep.apkPath != "UNKNOWN") "OverlayManager (${deep.apkPath})" else "OverlayManager (cmd overlay list)",
-                    scope = "RRO Overlay",
-                    target = deep?.targetPackage?.takeIf { it.isNotBlank() } ?: pkg,
-                    rawValue = if (enabled) "ENABLED" else "DISABLED/STATE_OTHER",
-                    status = if (enabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
-                    realObservedEffect = if (enabled) "Active RRO overlay" else "Present but inactive",
-                    note = buildString {
-                        append(trimmed)
-                        if (deep != null) {
-                            append(" | APK=${deep.apkPath} | Dir=$resolvedDir | target=${deep.targetPackage} | prio=${deep.priority}")
-                            if (keyEntriesPreview.isNotBlank()) append(" | Keys: $keyEntriesPreview")
-                        }
-                    }
-                )
-                components += DiscoveredComponent(
-                    id = "overlay_${idx}_${pkg.hashCode()}",
-                    name = pkg,
-                    category = ComponentCategory.OVERLAY,
-                    version = if (enabled) "ENABLED" else "INACTIVE",
-                    interfaceType = if (deep?.targetPackage?.isNotBlank() == true) "RRO -> ${deep.targetPackage}" else "RRO",
-                    path = resolvedApk,
-                    status = if (enabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
-                    knowledgeLevel = KnowledgeLevel.FACT,
-                    metadata = buildMap {
-                        put("apkPath", deep?.apkPath ?: "UNKNOWN")
-                        put("directory", resolvedDir)
-                        if (deep != null && deep.targetPackage.isNotBlank()) put("targetPackage", deep.targetPackage)
-                        if (deep != null) put("priority", deep.priority.toString())
-                        if (keyEntriesPreview.isNotBlank()) put("internalKeys", keyEntriesPreview.take(220))
-                    }
-                )
+                val pkg = trimmed.removePrefix("[x]").removePrefix("[ ]").trim().substringBefore(":").substringBefore(" ")
+                if (pkg.isBlank()) null else Triple(pkg, enabled, trimmed)
             }
+            .distinctBy { it.first }
+            .sortedWith(
+                compareByDescending<Triple<String, Boolean, String>> { overlayByPkg[it.first]?.fodRelevanceScore ?: -1 }
+                    .thenByDescending { overlayByPkg[it.first]?.provenInLiveMaps == true }
+                    .thenByDescending { it.second }
+                    .thenBy { it.first }
+            )
+            .take(80)
+
+        overlayEntries.forEachIndexed { idx, (pkg, enabled, trimmed) ->
+            seenOverlayPkgs += pkg
+            val deep = overlayByPkg[pkg]
+            val resolvedApk = deep?.apkPath?.takeIf { it != "UNKNOWN" } ?: pkg
+            val resolvedDir = deep?.directory?.takeIf { it != "UNKNOWN" } ?: "UNKNOWN"
+            val keyEntriesPreview = (deep?.decodedArscEntries.orEmpty() + deep?.fodConfigEntries.orEmpty())
+                .distinct().take(6).joinToString(" ; ")
+            patches += DetectedPatch(
+                id = "patch_rro_$idx",
+                name = pkg,
+                source = if (deep != null && deep.apkPath != "UNKNOWN") "OverlayManager (${deep.apkPath})" else "OverlayManager (cmd overlay list)",
+                scope = if ((deep?.fodRelevanceScore ?: 0) >= 40) "Proven FOD RRO Overlay" else "RRO Overlay",
+                target = deep?.targetPackage?.takeIf { it.isNotBlank() } ?: pkg,
+                rawValue = if (enabled) "ENABLED" else "DISABLED/STATE_OTHER",
+                status = when {
+                    enabled && (deep?.fodRelevanceScore ?: 0) >= 40 -> EvidenceStatus.CONFIRMED
+                    enabled -> EvidenceStatus.OBSERVED
+                    else -> EvidenceStatus.OBSERVED
+                },
+                realObservedEffect = when {
+                    (deep?.lookupWinners?.isNotEmpty() == true) -> "Active lookup winner (${deep.lookupWinners.size} key(s))"
+                    (deep?.fodRelevanceScore ?: 0) >= 40 -> "Contains decoded FOD ARSC/XML overrides (score=${deep?.fodRelevanceScore})"
+                    enabled -> "Active RRO overlay"
+                    else -> "Present but inactive"
+                },
+                note = buildString {
+                    append(trimmed)
+                    if (deep != null) {
+                        append(" | score=${deep.fodRelevanceScore} | liveMapped=${deep.provenInLiveMaps} | APK=${deep.apkPath} | Dir=$resolvedDir | target=${deep.targetPackage} | prio=${deep.priority}")
+                        if (deep.lookupWinners.isNotEmpty()) append(" | Lookup: ${deep.lookupWinners.take(3).joinToString("; ")}")
+                        if (keyEntriesPreview.isNotBlank()) append(" | Keys: $keyEntriesPreview")
+                    }
+                }
+            )
+            components += DiscoveredComponent(
+                id = "overlay_${idx}_${pkg.hashCode()}",
+                name = pkg,
+                category = ComponentCategory.OVERLAY,
+                version = if (enabled) "ENABLED" else "INACTIVE",
+                interfaceType = if (deep?.targetPackage?.isNotBlank() == true) "RRO -> ${deep.targetPackage}" else "RRO",
+                path = resolvedApk,
+                status = if (enabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
+                knowledgeLevel = KnowledgeLevel.FACT,
+                metadata = buildMap {
+                    put("apkPath", deep?.apkPath ?: "UNKNOWN")
+                    put("directory", resolvedDir)
+                    if (deep != null) {
+                        put("fodRelevanceScore", deep.fodRelevanceScore.toString())
+                        put("provenInLiveMaps", deep.provenInLiveMaps.toString())
+                        if (deep.lookupWinners.isNotEmpty()) put("lookupWinners", deep.lookupWinners.joinToString(" | ").take(240))
+                        if (deep.decodedArscEntries.isNotEmpty()) put("decodedArscEntries", deep.decodedArscEntries.take(8).joinToString(" | ").take(280))
+                        if (deep.targetPackage.isNotBlank()) put("targetPackage", deep.targetPackage)
+                        put("priority", deep.priority.toString())
+                    }
+                    if (keyEntriesPreview.isNotBlank()) put("internalKeys", keyEntriesPreview.take(240))
+                }
+            )
+        }
 
         // Also include deep-inspected overlays discovered via dumpsys overlay / partitions that weren't in cmd overlay list lines
         baseline.overlayInspections.filter { it.packageName !in seenOverlayPkgs }.forEachIndexed { idx, deep ->
             seenOverlayPkgs += deep.packageName
-            val keyEntriesPreview = deep.fodConfigEntries.take(5).joinToString(" ; ")
+            val keyEntriesPreview = (deep.decodedArscEntries + deep.fodConfigEntries).distinct().take(6).joinToString(" ; ")
             patches += DetectedPatch(
                 id = "patch_rro_deep_$idx",
                 name = deep.packageName,
                 source = "OverlayManager (${deep.apkPath})",
-                scope = "RRO Overlay",
+                scope = if (deep.fodRelevanceScore >= 40) "Proven FOD RRO Overlay" else "RRO Overlay",
                 target = deep.targetPackage.ifBlank { deep.packageName },
                 rawValue = if (deep.isEnabled) "ENABLED" else "DISABLED/STATE_OTHER",
                 status = if (deep.isEnabled) EvidenceStatus.CONFIRMED else EvidenceStatus.OBSERVED,
-                realObservedEffect = if (deep.isEnabled) "Active RRO overlay" else "Present but inactive",
-                note = "APK=${deep.apkPath} | Dir=${deep.directory} | target=${deep.targetPackage} | Keys: $keyEntriesPreview"
+                realObservedEffect = if (deep.fodRelevanceScore >= 40) "Decoded FOD ARSC/XML (score=${deep.fodRelevanceScore})" else if (deep.isEnabled) "Active RRO overlay" else "Present but inactive",
+                note = "score=${deep.fodRelevanceScore} | liveMapped=${deep.provenInLiveMaps} | APK=${deep.apkPath} | Dir=${deep.directory} | target=${deep.targetPackage} | Keys: $keyEntriesPreview"
             )
             components += DiscoveredComponent(
                 id = "overlay_deep_${idx}_${deep.packageName.hashCode()}",
@@ -846,9 +881,13 @@ object PatchAndArchitectureAnalyzer {
                 metadata = buildMap {
                     put("apkPath", deep.apkPath)
                     put("directory", deep.directory)
+                    put("fodRelevanceScore", deep.fodRelevanceScore.toString())
+                    put("provenInLiveMaps", deep.provenInLiveMaps.toString())
+                    if (deep.lookupWinners.isNotEmpty()) put("lookupWinners", deep.lookupWinners.joinToString(" | ").take(240))
+                    if (deep.decodedArscEntries.isNotEmpty()) put("decodedArscEntries", deep.decodedArscEntries.take(8).joinToString(" | ").take(280))
                     if (deep.targetPackage.isNotBlank()) put("targetPackage", deep.targetPackage)
                     put("priority", deep.priority.toString())
-                    if (keyEntriesPreview.isNotBlank()) put("internalKeys", keyEntriesPreview.take(220))
+                    if (keyEntriesPreview.isNotBlank()) put("internalKeys", keyEntriesPreview.take(240))
                 }
             )
         }
@@ -919,6 +958,26 @@ object PatchAndArchitectureAnalyzer {
                     accessNote = prov.accessNote
                 )
             }
+
+        // Add DEX source extracts (SystemUI / services.jar / framework.jar) as SERVICE components with extracted source outline metadata
+        baseline.dexSourceExtracts.forEachIndexed { idx, dex ->
+            components += DiscoveredComponent(
+                id = "dex_comp_${idx}_${dex.archivePath.hashCode()}",
+                name = "[DEX] ${dex.archivePath.substringAfterLast('/')}",
+                category = ComponentCategory.SERVICE,
+                version = "${dex.matchedClasses.size} classes / ${dex.matchedMethods.size} methods",
+                interfaceType = dex.targetHint,
+                path = dex.archivePath,
+                status = EvidenceStatus.CONFIRMED,
+                knowledgeLevel = KnowledgeLevel.FACT,
+                metadata = buildMap {
+                    put("targetHint", dex.targetHint)
+                    if (dex.matchedClasses.isNotEmpty()) put("classes", dex.matchedClasses.take(8).joinToString(" | ").take(260))
+                    if (dex.matchedMethods.isNotEmpty()) put("methods", dex.matchedMethods.take(8).joinToString(" | ").take(260))
+                    if (dex.matchedStrings.isNotEmpty()) put("strings", dex.matchedStrings.take(6).joinToString(" | ").take(240))
+                }
+            )
+        }
     }
 
     private fun reconstructSessionFlow(
@@ -1148,6 +1207,7 @@ object PatchAndArchitectureAnalyzer {
         sessionFlow: List<SessionEvent>,
         fingerDownChain: List<FingerDownStep>,
         sysfsTransitions: List<SysfsTransition>,
+        procLiveMaps: List<LiveProcessMapRecord>,
         findings: MutableList<InvestigationFinding>,
         language: AppLanguage
     ) {
@@ -1169,6 +1229,49 @@ object PatchAndArchitectureAnalyzer {
             status = if (fingerDownChain.any { it.status == EvidenceStatus.FAILED }) EvidenceStatus.FAILED else EvidenceStatus.CONFIRMED,
             knowledgeLevel = KnowledgeLevel.FACT
         )
+
+        if (procLiveMaps.isNotEmpty()) {
+            val newMapsTotal = procLiveMaps.sumOf { it.enrollmentNewMappedFiles.size }
+            val newFdsTotal = procLiveMaps.sumOf { it.enrollmentNewFds.size }
+            val topProcs = procLiveMaps.take(4).joinToString(" | ") { rec ->
+                "${rec.processName}(pid=${rec.pid}): ${rec.matchedFodPaths.take(3).joinToString(",")}"
+            }
+            findings += InvestigationFinding(
+                id = "find_proc_maps",
+                title = if (language == AppLanguage.FR) "Processus FOD actifs (/proc/<pid>/maps & fd)" else "Live FOD Process Maps (/proc/<pid>/maps & fd)",
+                detail = "${procLiveMaps.size} processus tracés | delta T0→T1 : +$newMapsTotal fichiers mappés, +$newFdsTotal descripteurs FD.",
+                evidenceSnippet = topProcs.ifBlank { "Processes mapped" },
+                status = EvidenceStatus.CONFIRMED,
+                knowledgeLevel = KnowledgeLevel.FACT
+            )
+        }
+
+        if (baseline.dexSourceExtracts.isNotEmpty()) {
+            val totalCls = baseline.dexSourceExtracts.sumOf { it.matchedClasses.size }
+            val totalMethods = baseline.dexSourceExtracts.sumOf { it.matchedMethods.size }
+            findings += InvestigationFinding(
+                id = "find_dex_sources",
+                title = if (language == AppLanguage.FR) "Extraction code source DEX (${baseline.dexSourceExtracts.size} archives)" else "DEX Source Code Extract (${baseline.dexSourceExtracts.size} archives)",
+                detail = "$totalCls classes FOD/UDFPS et $totalMethods signatures de méthodes extraites de SystemUI / Framework.",
+                evidenceSnippet = baseline.dexSourceExtracts.take(3).joinToString(" | ") { "${it.archivePath}: ${it.matchedClasses.take(3).joinToString(",")}" },
+                status = EvidenceStatus.CONFIRMED,
+                knowledgeLevel = KnowledgeLevel.FACT
+            )
+        }
+
+        val provenRros = baseline.overlayInspections.filter { it.fodRelevanceScore >= 40 || it.lookupWinners.isNotEmpty() }
+        if (provenRros.isNotEmpty()) {
+            findings += InvestigationFinding(
+                id = "find_proven_rros",
+                title = if (language == AppLanguage.FR) "Overlays RRO FOD prouvés par contenu ARSC/Lookup (${provenRros.size})" else "Content-Proven FOD RRO Overlays (${provenRros.size})",
+                detail = provenRros.take(4).joinToString(" | ") { "${it.packageName} (score=${it.fodRelevanceScore}, apk=${it.apkPath})" },
+                evidenceSnippet = provenRros.take(2).joinToString("\n") { ov ->
+                    "${ov.packageName}: ${(ov.lookupWinners + ov.decodedArscEntries).take(4).joinToString("; ")}"
+                },
+                status = EvidenceStatus.CONFIRMED,
+                knowledgeLevel = KnowledgeLevel.FACT
+            )
+        }
 
         val readableElfs = elfAnalyses.count { it.isReadable }
         findings += InvestigationFinding(

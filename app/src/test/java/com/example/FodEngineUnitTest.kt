@@ -1,6 +1,7 @@
 package com.example
 
 import com.example.engine.BaselineProbeResult
+import com.example.engine.BinarySourceDecoder
 import com.example.engine.DynamicProvenanceInspector
 import com.example.engine.ElfDisassembler
 import com.example.engine.FodComparatorEngine
@@ -8,6 +9,7 @@ import com.example.engine.PatchAndArchitectureAnalyzer
 import com.example.engine.PortAnalysisEngine
 import com.example.engine.PortZipDeepReader
 import com.example.engine.ShellExecutor
+import com.example.engine.SystemProbeCollector
 import com.example.i18n.AppLanguage
 import com.example.model.ComponentCategory
 import com.example.model.DetectedPatch
@@ -641,6 +643,472 @@ class FodEngineUnitTest {
         // Differences solely in Brightness / StablePhysical / ManufactureDate / frameRateOverride must normalize to identical!
         assertFalse(result.commonComponentDiffs.any { it.title == "DisplayEngine" })
     }
+
+    private fun buildTestUtf8StringPoolChunk(strings: List<String>): ByteArray {
+        val dataBaos = ByteArrayOutputStream()
+        val offsets = IntArray(strings.size)
+        strings.forEachIndexed { idx, s ->
+            offsets[idx] = dataBaos.size()
+            val utf8 = s.toByteArray(Charsets.UTF_8)
+            dataBaos.write(s.length and 0x7F)
+            dataBaos.write(utf8.size and 0x7F)
+            dataBaos.write(utf8)
+            dataBaos.write(0)
+        }
+        while (dataBaos.size() % 4 != 0) dataBaos.write(0)
+        val strData = dataBaos.toByteArray()
+        val headerSize = 28
+        val stringsStart = headerSize + strings.size * 4
+        val chunkSize = stringsStart + strData.size
+        val buf = ByteBuffer.allocate(chunkSize).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putShort(0x0001.toShort()) // RES_STRING_POOL_TYPE
+        buf.putShort(headerSize.toShort())
+        buf.putInt(chunkSize)
+        buf.putInt(strings.size)
+        buf.putInt(0)
+        buf.putInt(0x100) // UTF8_FLAG
+        buf.putInt(stringsStart)
+        buf.putInt(0)
+        offsets.forEach { buf.putInt(it) }
+        buf.put(strData)
+        return buf.array()
+    }
+
+    @Test
+    fun binarySourceDecoder_decodesBinaryXmlToReadablePseudoXml() {
+        val pool = buildTestUtf8StringPoolChunk(
+            listOf(
+                "http://schemas.android.com/apk/res/android",
+                "android",
+                "manifest",
+                "overlay",
+                "package",
+                "targetPackage",
+                "isStatic",
+                "priority",
+                "com.xiaomi.udfps.rro",
+                "com.android.systemui"
+            )
+        )
+
+        // StartElement "manifest" (package="com.xiaomi.udfps.rro")
+        val manifestElem = ByteBuffer.allocate(16 + 20 + 20).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(0x0102.toShort())
+            putShort(16.toShort())
+            putInt(56)
+            putInt(1)
+            putInt(-1)
+            // ext: ns=-1, name=2 ("manifest"), attrStart=20, attrSize=20, attrCount=1
+            putInt(-1)
+            putInt(2)
+            putShort(20.toShort())
+            putShort(20.toShort())
+            putShort(1.toShort())
+            putShort(0.toShort())
+            putShort(0.toShort())
+            putShort(0.toShort())
+            // attr: ns=-1, name=4 ("package"), rawVal=8, size=8,0,type=3,data=8
+            putInt(-1)
+            putInt(4)
+            putInt(8)
+            putShort(8.toShort())
+            put(0)
+            put(0x03)
+            putInt(8)
+        }.array()
+
+        // StartElement "overlay" (android:targetPackage="com.android.systemui", android:isStatic=true, android:priority=50)
+        val overlayElem = ByteBuffer.allocate(16 + 20 + 60).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(0x0102.toShort())
+            putShort(16.toShort())
+            putInt(96)
+            putInt(2)
+            putInt(-1)
+            putInt(-1)
+            putInt(3) // "overlay"
+            putShort(20.toShort())
+            putShort(20.toShort())
+            putShort(3.toShort())
+            putShort(0.toShort())
+            putShort(0.toShort())
+            putShort(0.toShort())
+            // attr 0: android:targetPackage="com.android.systemui"
+            putInt(0)
+            putInt(5)
+            putInt(9)
+            putShort(8.toShort())
+            put(0)
+            put(0x03)
+            putInt(9)
+            // attr 1: android:isStatic=true (0x12, data=1)
+            putInt(0)
+            putInt(6)
+            putInt(-1)
+            putShort(8.toShort())
+            put(0)
+            put(0x12)
+            putInt(1)
+            // attr 2: android:priority=50 (0x10, data=50)
+            putInt(0)
+            putInt(7)
+            putInt(-1)
+            putShort(8.toShort())
+            put(0)
+            put(0x10)
+            putInt(50)
+        }.array()
+
+        fun endElem(nameIdx: Int): ByteArray = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(0x0103.toShort())
+            putShort(16.toShort())
+            putInt(24)
+            putInt(3)
+            putInt(-1)
+            putInt(-1)
+            putInt(nameIdx)
+        }.array()
+
+        val endOverlay = endElem(3)
+        val endManifest = endElem(2)
+        val totalSize = 8 + pool.size + manifestElem.size + overlayElem.size + endOverlay.size + endManifest.size
+        val xmlBytes = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(0x0003.toShort()) // RES_XML_TYPE
+            putShort(8.toShort())
+            putInt(totalSize)
+            put(pool)
+            put(manifestElem)
+            put(overlayElem)
+            put(endOverlay)
+            put(endManifest)
+        }.array()
+
+        val decoded = BinarySourceDecoder.decodeBinaryXmlToPseudoXml(xmlBytes)
+        assertTrue(decoded.contains("<manifest package=\"com.xiaomi.udfps.rro\">"))
+        assertTrue(decoded.contains("<overlay android:targetPackage=\"com.android.systemui\" android:isStatic=\"true\" android:priority=\"50\" />"))
+        assertTrue(decoded.contains("</manifest>"))
+    }
+
+    @Test
+    fun binarySourceDecoder_decodesArscResourceTableEntries() {
+        val globalPool = buildTestUtf8StringPoolChunk(listOf("/sys/class/drm/card0-DSI-1/disp_param"))
+        val typePool = buildTestUtf8StringPoolChunk(listOf("bool", "string"))
+        val keyPool = buildTestUtf8StringPoolChunk(listOf("config_supportsUdfps", "config_udfps_hbm_sysfs_node"))
+
+        // Type 1 ("bool"): 1 entry -> config_supportsUdfps = true
+        val boolEntryBytes = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(8.toShort()) // size
+            putShort(0.toShort()) // flags
+            putInt(0) // keyIdx = "config_supportsUdfps"
+            putShort(8.toShort())
+            put(0)
+            put(0x12) // TYPE_INT_BOOLEAN
+            putInt(1)
+        }.array()
+        val boolTypeChunk = ByteBuffer.allocate(24 + 4 + boolEntryBytes.size).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(0x0201.toShort()) // RES_TABLE_TYPE_TYPE
+            putShort(20.toShort()) // headerSize=20 -> offsets at +20? Let's make headerSize=20 and write 1 offset at +20, entriesStart=24 Wait: keep offsets at 20..24
+            // Wait: in ResTable_type, cHeader includes ResTable_config (headerSize=20 puts offsets at 20). Let's align cleanly:
+            putInt(24 + boolEntryBytes.size)
+            put(1) // typeId = 1 ("bool")
+            put(0) // flags
+            putShort(0.toShort())
+            putInt(1) // entryCount
+            putInt(24) // entriesStart = 20 + 4
+            putInt(0) // offset[0] = 0
+            put(boolEntryBytes)
+        }.array().copyOf(24 + boolEntryBytes.size)
+
+        // Type 2 ("string"): 1 entry -> config_udfps_hbm_sysfs_node = globalPool[0]
+        val strEntryBytes = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(8.toShort())
+            putShort(0.toShort())
+            putInt(1) // keyIdx = "config_udfps_hbm_sysfs_node"
+            putShort(8.toShort())
+            put(0)
+            put(0x03) // TYPE_STRING
+            putInt(0) // globalPool[0]
+        }.array()
+        val strTypeChunk = ByteBuffer.allocate(24 + strEntryBytes.size).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(0x0201.toShort())
+            putShort(20.toShort())
+            putInt(24 + strEntryBytes.size)
+            put(2) // typeId = 2 ("string")
+            put(0)
+            putShort(0.toShort())
+            putInt(1)
+            putInt(24)
+            putInt(0)
+            put(strEntryBytes)
+        }.array()
+
+        val pkgHeaderSize = 288
+        val typeStringsOffset = pkgHeaderSize
+        val keyStringsOffset = typeStringsOffset + typePool.size
+        val pkgChunkSize = pkgHeaderSize + typePool.size + keyPool.size + boolTypeChunk.size + strTypeChunk.size
+
+        val pkgChunk = ByteBuffer.allocate(pkgChunkSize).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(0x0200.toShort()) // RES_TABLE_PACKAGE_TYPE
+            putShort(pkgHeaderSize.toShort())
+            putInt(pkgChunkSize)
+            putInt(0x7F) // id
+            val pkgNameBytes = "com.android.systemui.udfps".toByteArray(Charsets.UTF_16LE)
+            val nameBuf = ByteArray(256)
+            System.arraycopy(pkgNameBytes, 0, nameBuf, 0, pkgNameBytes.size)
+            put(nameBuf)
+            putInt(typeStringsOffset) // offset 268
+            putInt(typePool.size)
+            putInt(keyStringsOffset) // offset 276
+            putInt(keyPool.size)
+            putInt(0) // typeIdOffset
+            put(typePool)
+            put(keyPool)
+            put(boolTypeChunk)
+            put(strTypeChunk)
+        }.array()
+
+        val tableSize = 12 + globalPool.size + pkgChunk.size
+        val arscBytes = ByteBuffer.allocate(tableSize).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(0x0002.toShort()) // RES_TABLE_TYPE
+            putShort(12.toShort())
+            putInt(tableSize)
+            putInt(1) // packageCount
+            put(globalPool)
+            put(pkgChunk)
+        }.array()
+
+        val decoded = BinarySourceDecoder.decodeArscResourceEntries(arscBytes)
+        assertTrue(decoded.packageNames.contains("com.android.systemui.udfps"))
+        assertTrue(decoded.allFodOrConfigEntries.any {
+            it.typeName == "bool" && it.keyName == "config_supportsUdfps" && it.valueText == "true"
+        })
+        assertTrue(decoded.allFodOrConfigEntries.any {
+            it.typeName == "string" && it.keyName == "config_udfps_hbm_sysfs_node" && it.valueText == "/sys/class/drm/card0-DSI-1/disp_param"
+        })
+    }
+
+    @Test
+    fun binarySourceDecoder_extractsFodClassesMethodsAndStringsFromDexInApk() {
+        fun encodeUleb128(value: Int): ByteArray {
+            val out = ByteArrayOutputStream()
+            var v = value
+            do {
+                var b = v and 0x7F
+                v = v ushr 7
+                if (v != 0) b = b or 0x80
+                out.write(b)
+            } while (v != 0)
+            return out.toByteArray()
+        }
+
+        // Strings must be sorted in a valid DEX; our parser indexes directly so order only affects convention.
+        val strings = listOf(
+            "Lcom/android/systemui/biometrics/UdfpsController;",
+            "Lcom/android/systemui/biometrics/UdfpsView;",
+            "/sys/class/drm/card0-DSI-1/disp_param",
+            "V",
+            "onFingerDown"
+        )
+        // Layout:
+        // Header (112 bytes)
+        // string_ids (5 * 4 = 20) at 112..132
+        // type_ids (3 * 4 = 12) at 132..144 -> string indices 0, 1, 3
+        // proto_ids (1 * 12 = 12) at 144..156 -> shortyIdx=3("V"), returnTypeIdx=2("V"), paramsOff=0
+        // method_ids (1 * 8 = 8) at 156..164 -> classIdx=0, protoIdx=0, nameIdx=4("onFingerDown")
+        // class_defs (1 * 32 = 32) at 164..196 -> classIdx=0, accessFlags=1, superclassIdx=1, ...
+        // string data starting at 196
+        val strDataBaos = ByteArrayOutputStream()
+        val strDataOffsets = IntArray(strings.size)
+        val dataBase = 196
+        strings.forEachIndexed { idx, s ->
+            strDataOffsets[idx] = dataBase + strDataBaos.size()
+            val utf8 = s.toByteArray(Charsets.UTF_8)
+            strDataBaos.write(encodeUleb128(s.length))
+            strDataBaos.write(utf8)
+            strDataBaos.write(0)
+        }
+        val strData = strDataBaos.toByteArray()
+        val fileSize = dataBase + strData.size
+        val dex = ByteBuffer.allocate(fileSize).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put("dex\n035\u0000".toByteArray(Charsets.US_ASCII)) // 0..8
+            putInt(0) // checksum 8..12
+            put(ByteArray(20)) // sha1 12..32
+            putInt(fileSize) // 32
+            putInt(112) // header_size 36
+            putInt(0x12345678) // endian_tag 40
+            putInt(0); putInt(0) // link 44..52
+            putInt(0) // map_off 52
+            putInt(strings.size); putInt(112) // string_ids 56..64
+            putInt(3); putInt(132) // type_ids 64..72
+            putInt(1); putInt(144) // proto_ids 72..80
+            putInt(0); putInt(0) // field_ids 80..88
+            putInt(1); putInt(156) // method_ids 88..96
+            putInt(1); putInt(164) // class_defs 96..104
+            putInt(strData.size); putInt(dataBase) // data 104..112
+
+            // string_ids @ 112
+            strDataOffsets.forEach { putInt(it) }
+            // type_ids @ 132
+            putInt(0); putInt(1); putInt(3)
+            // proto_ids @ 144
+            putInt(3); putInt(2); putInt(0)
+            // method_ids @ 156
+            putShort(0.toShort()); putShort(0.toShort()); putInt(4)
+            // class_defs @ 164
+            putInt(0) // class_idx
+            putInt(1) // access_flags = public
+            putInt(1) // superclass_idx
+            putInt(0); putInt(0); putInt(0); putInt(0); putInt(0)
+            // string data @ 196
+            put(strData)
+        }.array()
+
+        val apkBaos = ByteArrayOutputStream()
+        ZipOutputStream(apkBaos).use { zip ->
+            zip.putNextEntry(ZipEntry("classes2.dex"))
+            zip.write(dex)
+            zip.closeEntry()
+        }
+
+        val extracted = BinarySourceDecoder.extractFodDexSourcesFromArchive(
+            archiveBytes = apkBaos.toByteArray(),
+            archivePath = "/system_ext/priv-app/SystemUI/SystemUI.apk",
+            targetHint = "com.android.systemui"
+        )
+        assertTrue(extracted != null)
+        assertTrue(extracted?.matchedClasses?.any { it.contains("UdfpsController") } == true)
+        assertTrue(extracted?.matchedMethods?.any { it.contains("onFingerDown") } == true)
+        assertTrue(extracted?.matchedStrings?.any { it.contains("/sys/class/drm/card0-DSI-1/disp_param") } == true)
+    }
+
+    @Test
+    fun contentDrivenOverlayScoring_prefersAutoNamedFodRroOverSpoonOverlayWithoutFodContent() {
+        val genericSpoon = OverlayDeepInspection(
+            packageName = "com.android.systemui.overlay.spoonoverlay2025",
+            targetPackage = "com.android.systemui",
+            apkPath = "/product/overlay/SpoonOverlay2025.apk",
+            directory = "/product/overlay",
+            isEnabled = true,
+            isStatic = false,
+            priority = 100,
+            manifestSummary = listOf("targetPackage=com.android.systemui"),
+            fodConfigEntries = emptyList(),
+            decodedArscEntries = listOf("color/accent_device_default = #ff3ddc84"),
+            pseudoXmlSource = "<overlay targetPackage=\"com.android.systemui\" />"
+        )
+        val realAutoRro = OverlayDeepInspection(
+            packageName = "android.auto_generated_rro_product__",
+            targetPackage = "android",
+            apkPath = "/product/overlay/framework-res__auto_generated_rro_product.apk",
+            directory = "/product/overlay",
+            isEnabled = true,
+            isStatic = true,
+            priority = 1,
+            provenInLiveMaps = true,
+            lookupWinners = listOf("android:bool/config_supportsUdfps -> apk=/product/overlay/framework-res__auto_generated_rro_product.apk"),
+            decodedArscEntries = listOf(
+                "ARSC bool/config_supportsUdfps = true",
+                "ARSC array/config_biometric_sensors = [0:2:15]"
+            ),
+            fodConfigEntries = listOf("VALUE bool/config_supportsUdfps = true"),
+            pseudoXmlSource = "<overlay targetPackage=\"android\" isStatic=\"true\" />"
+        )
+
+        val spoonScore = DynamicProvenanceInspector.computeFodOverlayScore(genericSpoon)
+        val realScore = DynamicProvenanceInspector.computeFodOverlayScore(realAutoRro)
+        assertTrue("Real FOD RRO score ($realScore) must far exceed empty UI overlay score ($spoonScore)", realScore > spoonScore + 100)
+
+        // Verify PortAnalysisEngine routes generic zero-FOD overlay to sharedNoise/filtered rather than top FOD failure
+        val romOverlays = listOf(
+            genericSpoon.copy(fodRelevanceScore = spoonScore),
+            realAutoRro.copy(fodRelevanceScore = realScore)
+        )
+        fun zipFrom(map: Map<String, String>): ByteArray {
+            val baos = ByteArrayOutputStream()
+            ZipOutputStream(baos).use { z ->
+                map.forEach { (name, content) ->
+                    z.putNextEntry(ZipEntry(name))
+                    z.write(content.toByteArray(Charsets.UTF_8))
+                    z.closeEntry()
+                }
+            }
+            return baos.toByteArray()
+        }
+        val romZip = PortZipDeepReader.readCompleteZipStream(
+            ByteArrayInputStream(
+                zipFrom(
+                    mapOf(
+                        "metadata/environment.txt" to "Boot Signature: 4.14.357\nVendor Fingerprint: mustang",
+                        "raw/dumpsys_overlay.txt" to "[x] com.android.systemui.overlay.spoonoverlay2025\n[x] android.auto_generated_rro_product__\n",
+                        "raw/overlay_deep_inspect.txt" to DynamicProvenanceInspector.serializeOverlayDeepInspect(romOverlays)
+                    )
+                )
+            ),
+            "ROM",
+            "rom_content.zip"
+        )
+        val gsiZip = PortZipDeepReader.readCompleteZipStream(
+            ByteArrayInputStream(
+                zipFrom(
+                    mapOf(
+                        "metadata/environment.txt" to "Boot Signature: 4.14.357\nVendor Fingerprint: mustang",
+                        "raw/dumpsys_overlay.txt" to "[x] org.treble.generic\n"
+                    )
+                )
+            ),
+            "GSI",
+            "gsi_empty.zip"
+        )
+        val result = PortAnalysisEngine.analyze(romZip, gsiZip, AppLanguage.FR)
+        assertTrue(result.extractableFiles.any { it.title == "android.auto_generated_rro_product__" })
+        assertFalse(result.extractableFiles.any { it.title == "com.android.systemui.overlay.spoonoverlay2025" })
+        assertTrue(result.sharedNoiseSamples.any { it.title == "com.android.systemui.overlay.spoonoverlay2025" })
+    }
+
+    @Test
+    fun systemProbeCollector_parsesProcMapsAndComputesEnrollmentDelta() {
+        val pidNames = mapOf(1200 to "com.android.systemui", 450 to "vendor.goodix.fp")
+        val rawT0 = """
+            === PID 1200 ===
+            /system_ext/priv-app/SystemUI/SystemUI.apk
+            /product/overlay/UdfpsOverlay.apk
+            /system/framework/framework.jar
+            --- FD 1200 ---
+            /dev/binder
+            === PID 450 ===
+            /vendor/lib64/libgf_hal.so
+            --- FD 450 ---
+            /dev/goodix_fp
+        """.trimIndent()
+        val rawT1 = """
+            === PID 1200 ===
+            /system_ext/priv-app/SystemUI/SystemUI.apk
+            /product/overlay/UdfpsOverlay.apk
+            /system/framework/framework.jar
+            /vendor/overlay/DynamicUdfpsHbm.apk
+            --- FD 1200 ---
+            /dev/binder
+            /sys/class/drm/card0-DSI-1/disp_param
+            === PID 450 ===
+            /vendor/lib64/libgf_hal.so
+            /vendor/lib64/libgf_udfps_algo.so
+            --- FD 450 ---
+            /dev/goodix_fp
+        """.trimIndent()
+
+        val t0 = SystemProbeCollector.parseProcMapsOutput(rawT0, pidNames)
+        val t1 = SystemProbeCollector.parseProcMapsOutput(rawT1, pidNames)
+        val merged = SystemProbeCollector.mergeProcMapsWithDelta(t0, t1)
+
+        val sysUi = merged.first { it.pid == 1200 }
+        assertTrue(sysUi.mappedApks.contains("/product/overlay/UdfpsOverlay.apk"))
+        assertTrue(sysUi.enrollmentNewMappedFiles.contains("/vendor/overlay/DynamicUdfpsHbm.apk"))
+        assertTrue(sysUi.enrollmentNewFds.contains("/sys/class/drm/card0-DSI-1/disp_param"))
+
+        val hal = merged.first { it.pid == 450 }
+        assertTrue(hal.mappedLibs.contains("/vendor/lib64/libgf_hal.so"))
+        assertTrue(hal.enrollmentNewMappedFiles.contains("/vendor/lib64/libgf_udfps_algo.so"))
+    }
 }
+
 
 
